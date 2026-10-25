@@ -240,6 +240,41 @@ const MUTATIONS = [
       'форму вывода, а не предикат',
   },
   {
+    name: 'запрет Р-356: НАБЛЮДАЕМОЕ ПОДМЕНЕНО — следим за ведущим, а не за именем',
+    file: 'src/registry.ts',
+    from:
+      '    const winners = instruments\n' +
+      '      .filter((i) => i.symbol === symbol && i.category === route.category)',
+    to:
+      '    const winners = instruments\n' +
+      '      .filter((i) => i.symbol === symbol && i.provider === route.leader?.providerId)',
+    expect:
+      'модульный: это ровно та ошибка, которую я чуть не внёс сам. Сторож на ' +
+      'ВЕДУЩЕМ краснеет на каждом законном включении и выключении источника — ' +
+      'обязаны покраснеть проверки «молчит на законном», и именно они отличают ' +
+      'правильное наблюдаемое от первого, ложно срабатывающего',
+  },
+  {
+    name: 'запрет Р-356: сторож подмены инструмента снят целиком',
+    file: 'src/admin.ts',
+    from: "    const changes = symbolInstrumentChanges(guard.catalog, current, parsed.data);",
+    to: '    const changes = [];',
+    expect: 'интеграционный: под постоянным именем встаёт другой актив, и никто не против',
+  },
+  {
+    name: 'запрет Р-356: подмену ловим только там, где был ряд',
+    file: 'src/registry.ts',
+    from: '    if (was === undefined) continue;\n    if (was !== meant) out.push({ symbol, from: was, to: meant });',
+    to:
+      '    if (was === undefined) continue;\n' +
+      '    const hadLeader = resolveRouting(instruments, current).routes.get(symbol)?.leader != null;\n' +
+      '    if (hadLeader && was !== meant) out.push({ symbol, from: was, to: meant });',
+    expect:
+      'модульный: возвращает ровно ту слепоту, из-за которой сторож промолчал на ' +
+      'стенде. Обязан покраснеть тест «ловится и когда РЯДА НЕ БЫЛО» и НЕ должны ' +
+      'краснеть остальные — иначе мутация ломает не то',
+  },
+  {
     name: 'запрет Р-318: переключатель открыт по умолчанию',
     file: 'src/server.ts',
     from: 'allowIdentityChange: deps.allowRoutingIdentityChange ?? false,',
@@ -270,8 +305,8 @@ const MUTATIONS = [
   {
     name: 'словарь: ось ручки заведена мимо §4г (сверки состава не было вовсе)',
     file: 'src/admin.ts',
-    from: "  'routing-identity-change',\n] as const;",
-    to: "  'routing-identity-change',\n  'routing-unhappy',\n] as const;",
+    from: "  'symbol-instrument-change',\n] as const;",
+    to: "  'symbol-instrument-change',\n  'routing-unhappy',\n] as const;",
     expect: 'модульный: до 25.10 эта мутация не красила НИЧЕГО — сверялся только стиль',
   },
   {
