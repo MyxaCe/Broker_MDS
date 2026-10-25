@@ -103,6 +103,13 @@ async function boot(options: {
   keys?: Map<string, string>;
   catalogSource?: string;
   /**
+   * Своя вселенная для одного опыта. Нужна там, где проверяется
+   * столкновение канонических имён: общий каталог пришлось бы расширить, и
+   * у соседних проверок поехали бы объявленные числа охвата — красное не о
+   * том, что они проверяют.
+   */
+  catalog?: CatalogInstrument[];
+  /**
    * Умолчание здесь **то же, что в бою** — запрещено. Стенд, по умолчанию
    * разрешающий то, что в бою запрещено, проверяет не ту систему.
    */
@@ -118,7 +125,7 @@ async function boot(options: {
   const origin = options.origin ?? 'file';
 
   const server = createMdsServer({
-    catalog: CATALOG,
+    catalog: options.catalog ?? CATALOG,
     catalogSource: options.catalogSource ?? 'binance-exchange-info',
     loaded:
       origin === 'error'
@@ -472,6 +479,68 @@ describe('лучшие цены на проводе · сквозь весь с�
     expect(body.items[0]?.price).toBe(2_400);
     expect(body.items[0]).toHaveProperty('bid', null);
     expect(body.items[0]).toHaveProperty('ask', null);
+  });
+});
+
+describe('ручка · подмена инструмента под постоянным именем (Р-356)', () => {
+  /*
+    Случай стенда 25.10, воспроизведённый через HTTP.
+
+    Своя вселенная: `EURUSD` стоит ДВАЖДЫ — крипто-парой у binance и
+    форексом у twelvedata. Второй ВЫКЛЮЧЕН, поэтому цены у символа нет
+    вовсе и прежнего ведущего не существует: сосед `routing-identity-change`
+    здесь молчит законно, и промолчал на стенде.
+  */
+  const COLLIDING: CatalogInstrument[] = [
+    instrument('BTCUSD', 'binance'),
+    instrument('EURUSD', 'binance', 'crypto'),
+    instrument('EURUSD', 'twelvedata', 'forex'),
+  ];
+
+  const onlyBinance = (): Registry => {
+    const r = builtinRegistry();
+    return { ...r, providers: r.providers.map((p) => ({ ...p, requiresKey: false })) };
+  };
+
+  it('перестановка precedence отклонена кодом symbol-instrument-change', async () => {
+    const h = await boot({ catalog: COLLIDING, registry: onlyBinance() });
+    // До правки имя означает форекс, и цены нет: источник выключен.
+    const before = await asJson(await fetch(`${h.base}/v1/quotes?symbols=EURUSD`));
+    expect(before.unavailable).toEqual([{ symbol: 'EURUSD', reason: 'source-disabled' }]);
+
+    const next = onlyBinance();
+    next.categoryPrecedence = ['crypto', 'forex', 'metals', 'indices', 'stocks', 'energy'];
+    const res = await admin(h, { method: 'PUT', body: JSON.stringify(next) });
+    expect(res.status).toBe(409);
+    const body = await asJson(res);
+    expect(body.error).toBe('symbol-instrument-change');
+    expect(body.detail).toContain('EURUSD');
+    expect(body.detail).toContain('forex');
+    expect(body.detail).toContain('crypto');
+
+    // Правка отклонена целиком: имя по-прежнему означает прежнее, и
+    // внешний признак не ухудшился с «выключен» на «молчит».
+    const after = await asJson(await fetch(`${h.base}/v1/quotes?symbols=EURUSD`));
+    expect(after.unavailable).toEqual([{ symbol: 'EURUSD', reason: 'source-disabled' }]);
+    expect(h.server.registry()?.version).toBe(0);
+  });
+
+  it('переключатель снят → та же правка проходит: запрет ожидание, а не вечность', async () => {
+    const h = await boot({
+      catalog: COLLIDING,
+      registry: onlyBinance(),
+      allowRoutingIdentityChange: true,
+    });
+    const next = onlyBinance();
+    next.categoryPrecedence = ['crypto', 'forex', 'metals', 'indices', 'stocks', 'energy'];
+    expect((await admin(h, { method: 'PUT', body: JSON.stringify(next) })).status).toBe(200);
+  });
+
+  it('МОЛЧИТ НА ЗАКОННОМ: выключение источника при той же вселенной', async () => {
+    const h = await boot({ catalog: COLLIDING, registry: onlyBinance() });
+    const next = onlyBinance();
+    next.providers = next.providers.map((p) => (p.id === 'binance' ? { ...p, enabled: false } : p));
+    expect((await admin(h, { method: 'PUT', body: JSON.stringify(next) })).status).toBe(200);
   });
 });
 

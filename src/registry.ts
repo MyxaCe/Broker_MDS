@@ -414,6 +414,77 @@ export function leaderIdentityChanges(
   return out;
 }
 
+/** Символ, под которым правка меняет **сам инструмент**, а не его источник. */
+export interface SymbolInstrumentChange {
+  symbol: string;
+  /** Что имя означало. */
+  from: string;
+  /** Что станет означать. */
+  to: string;
+}
+
+/**
+ * Что стоит за каноническим именем: строки каталога, выигравшие
+ * столкновение имён. Зависит **только** от `categoryPrecedence` и каталога —
+ * ни `enabled`, ни `priority`, ни молчание источника сюда не входят.
+ *
+ * Это и есть причина, по которой наблюдаемым здесь не может быть ведущий:
+ * ведущий исчезает при обычном выключении источника, и сторож, на нём
+ * построенный, краснел бы на каждой законной правке. Замерено при разборе:
+ * 513 ложных срабатываний на одном выключении и 17 на включении.
+ */
+function nameMeans(instruments: CatalogInstrument[], registry: Registry): Map<string, string> {
+  const table = resolveRouting(instruments, registry);
+  const out = new Map<string, string>();
+  for (const [symbol, route] of table.routes) {
+    const winners = instruments
+      .filter((i) => i.symbol === symbol && i.category === route.category)
+      .map((i) => `${i.providerSymbol} (${i.category}, ${i.provider})`)
+      .sort();
+    out.set(symbol, winners.join(' + ') || `(${route.category})`);
+  }
+  return out;
+}
+
+/**
+ * Какие символы после правки станут означать **другой инструмент** (Р-356,
+ * `КОНТРАКТЫ.md` §4г, код `symbol-instrument-change`).
+ *
+ * **Почему это отдельный сторож, а не половина соседнего.** Соседний
+ * (`leaderIdentityChanges`) отвечает на вопрос «кто даёт цену» и по
+ * построению молчит, когда прежнего ведущего не было: появление источника —
+ * новый ряд, и это законно. Здесь вопрос другой — «что означает имя», — и
+ * ответ на него не зависит от того, была ли цена.
+ *
+ * **Чем это доказано, а не предположено.** 25.10 зона развёртывания
+ * переставила `categoryPrecedence` на стенде, где второй поставщик выключен.
+ * У `EURUSD` цены не было вовсе (`source-disabled`), и соседний сторож
+ * промолчал законно. Но победителем столкновения стала крипто-строка, и под
+ * именем `EURUSD` встала пара `eurusdt` — другой актив. Та же правка при
+ * включённом поставщике соседним сторожем ловится. **То есть он следил за
+ * тем, была ли цена, а не за тем, подменился ли актив.**
+ *
+ * Вред здесь не «разрыв ряда», а **начало ряда не о том**: человек видел
+ * «цены нет» и увидит правдоподобное число про другой инструмент. Прочерк
+ * безопаснее такого числа.
+ */
+export function symbolInstrumentChanges(
+  instruments: CatalogInstrument[],
+  current: Registry,
+  next: Registry,
+): SymbolInstrumentChange[] {
+  const before = nameMeans(instruments, current);
+  const after = nameMeans(instruments, next);
+  const out: SymbolInstrumentChange[] = [];
+  for (const [symbol, meant] of after) {
+    const was = before.get(symbol);
+    // Символа раньше не было — это пополнение вселенной, а не подмена.
+    if (was === undefined) continue;
+    if (was !== meant) out.push({ symbol, from: was, to: meant });
+  }
+  return out;
+}
+
 /** Сводка покрытия. Единица названа в поле `unit` — число без единицы нечестно. */
 export interface RoutingSummary {
   unit: 'канонических символов каталога после разрешения коллизий';

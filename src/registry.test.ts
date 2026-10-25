@@ -6,6 +6,7 @@ import {
   builtinRegistry,
   diffRouting,
   leaderIdentityChanges,
+  symbolInstrumentChanges,
   registrySchema,
   resolveRouting,
   summarizeRouting,
@@ -205,6 +206,86 @@ describe('реестр · смена ЛИЧНОСТИ ведущего, а не 
     const after = registry();
     after.providers = after.providers.map((p) => ({ ...p, label: `${p.label} (переименован)` }));
     expect(leaderIdentityChanges(CATALOG, registry(), after)).toEqual([]);
+  });
+});
+
+describe('реестр · подмена ИНСТРУМЕНТА под постоянным именем (Р-356)', () => {
+  /*
+    Второй сторож отвечает на ДРУГОЙ вопрос: не «кто даёт цену», а «что
+    означает имя». Проверяется прежде всего то, на чём первый слеп, —
+    случай, где прежнего ряда не было.
+
+    Фикстура годится: `EURUSD` есть и крипто-строкой (binance), и
+    форексной (twelvedata), а precedence решает, какая стоит за именем.
+  */
+  const flipped = () =>
+    registry({ categoryPrecedence: ['crypto', 'forex', 'metals', 'indices', 'stocks', 'energy'] });
+
+  const withTwelveOff = (r: Registry): Registry => ({
+    ...r,
+    providers: r.providers.map((p) => (p.id === 'twelvedata' ? { ...p, enabled: false } : p)),
+  });
+
+  it('перестановка precedence подменяет актив — ловится, когда ряд БЫЛ', () => {
+    const changes = symbolInstrumentChanges(CATALOG, registry(), flipped());
+    expect(changes).toHaveLength(1);
+    expect(changes[0]?.symbol).toBe('EURUSD');
+    expect(changes[0]?.from).toContain('forex');
+    expect(changes[0]?.to).toContain('crypto');
+  });
+
+  it('ловится и когда РЯДА НЕ БЫЛО — вот чего не умеет сосед', () => {
+    // Второй поставщик выключен: цены у EURUSD нет вовсе, прежнего
+    // ведущего нет. Сосед молчит законно, а актив всё равно подменяется.
+    // Это ровно случай стенда 25.10.
+    const off = withTwelveOff(registry());
+    const offFlipped = withTwelveOff(flipped());
+    expect(leaderIdentityChanges(CATALOG, off, offFlipped)).toEqual([]);
+    expect(symbolInstrumentChanges(CATALOG, off, offFlipped)).toHaveLength(1);
+  });
+
+  it('называет обе стороны подмены, а не только то, что «нельзя»', () => {
+    // Отказ без имён отправляет чинить вслепую. В тексте обязаны быть
+    // ОБЕ стороны: и символ у источника, и сам источник, и категория —
+    // иначе «инструмент подменился» неотличимо от «что-то изменилось».
+    const c = symbolInstrumentChanges(CATALOG, registry(), flipped())[0]!;
+    for (const part of ['eurusd', 'forex', 'twelvedata']) expect(c.from).toContain(part);
+    for (const part of ['eurusd', 'crypto', 'binance']) expect(c.to).toContain(part);
+    expect(c.from).not.toBe(c.to);
+  });
+
+  it('МОЛЧИТ НА ЗАКОННОМ: выключение источника', () => {
+    const after = registry();
+    after.providers = after.providers.map((p) => (p.id === 'binance' ? { ...p, enabled: false } : p));
+    expect(symbolInstrumentChanges(CATALOG, registry(), after)).toEqual([]);
+  });
+
+  it('МОЛЧИТ НА ЗАКОННОМ: включение источника', () => {
+    const before = registry();
+    before.providers = before.providers.map((p) =>
+      p.id === 'binance' ? { ...p, enabled: false } : p,
+    );
+    expect(symbolInstrumentChanges(CATALOG, before, registry())).toEqual([]);
+  });
+
+  it('МОЛЧИТ НА ЗАКОННОМ: смена приоритета источника', () => {
+    const after = registry();
+    after.providers = after.providers.map((p) => (p.id === 'metals-alt' ? { ...p, priority: 5 } : p));
+    expect(symbolInstrumentChanges(CATALOG, registry(), after)).toEqual([]);
+  });
+
+  it('МОЛЧИТ НА ЗАКОННОМ: сужение covers', () => {
+    const after = registry();
+    after.providers = after.providers.map((p) =>
+      p.id === 'twelvedata' ? { ...p, covers: ['metals' as const] } : p,
+    );
+    expect(symbolInstrumentChanges(CATALOG, registry(), after)).toEqual([]);
+  });
+
+  it('МОЛЧИТ НА ЗАКОННОМ: добавление второго источника', () => {
+    const after = registry();
+    after.providers = [...after.providers, { ...after.providers[0]!, id: 'binance-2', priority: 15 }];
+    expect(symbolInstrumentChanges(CATALOG, registry(), after)).toEqual([]);
   });
 });
 
