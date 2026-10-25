@@ -1,6 +1,13 @@
 import { timingSafeEqual } from 'node:crypto';
-import { registrySchema, summarizeRouting, type Registry, type RoutingTable } from './registry.js';
+import {
+  leaderIdentityChanges,
+  registrySchema,
+  summarizeRouting,
+  type Registry,
+  type RoutingTable,
+} from './registry.js';
 import type { RegistryOrigin } from './registry-store.js';
+import type { CatalogInstrument } from './types.js';
 
 /**
  * Служебная ручка управления реестром провайдеров (Р-047).
@@ -36,7 +43,16 @@ export type AuthOutcome =
    * пустили» разные диагнозы, и путать их значит отправлять чинить не то.
    */
   | { ok: false; code: Extract<AdminCode, 'control-plane-disabled'>; status: 503; detail: string }
-  | { ok: false; code: Extract<AdminCode, 'unauthorized'>; status: 401; detail: UnauthorizedDetail };
+  /**
+   * Не пустили, и **причина едет самим кодом** (Р-339, решение штаба 25.10).
+   *
+   * Раньше здесь стоял общий `unauthorized`, а причина пряталась в
+   * `detail`. Это было **особым случаем, а не уровнем абстракции**: у всех
+   * прочих отказов этой ручки конкретная причина едет кодом, и только у
+   * проверки доступа было иначе. Довода про скрытность не было — уточнение
+   * и так называло, отсутствовал токен или был неверен.
+   */
+  | { ok: false; code: Extract<AdminCode, 'no-token' | 'bad-token'>; status: 401; detail: string };
 
 /**
  * Все машинные коды отказа служебной ручки, перечнем, который видно в
@@ -51,7 +67,12 @@ export type AuthOutcome =
  */
 export const ADMIN_CODES = [
   'control-plane-disabled',
-  'unauthorized',
+  /**
+   * Не пустили. Два кода, а не один общий с уточнением (Р-339): причина
+   * едет кодом, как у всех остальных отказов этой ручки.
+   */
+  'no-token',
+  'bad-token',
   'registry-unreadable',
   'bad-body',
   'version-required',
@@ -59,14 +80,22 @@ export const ADMIN_CODES = [
   'invalid-registry',
   'method-not-allowed',
   'not-found',
+  /**
+   * Правка меняет **личность ведущего источника** хотя бы у одного символа,
+   * а потребитель ещё не умеет показывать разрыв ряда (§4г, Р-318).
+   */
+  'routing-identity-change',
 ] as const;
 
 export type AdminCode = (typeof ADMIN_CODES)[number];
 
-/** Уточнение к `unauthorized`: заголовка не было или он не тот. */
-export const UNAUTHORIZED_DETAILS = ['no-token', 'bad-token'] as const;
-
-export type UnauthorizedDetail = (typeof UNAUTHORIZED_DETAILS)[number];
+/*
+  Перечня `UNAUTHORIZED_DETAILS` здесь больше нет (Р-339): `no-token` и
+  `bad-token` стали полноценными кодами в `ADMIN_CODES`. Второй перечень
+  рядом с первым и был тем, из-за чего сверка состава с §4г не сходилась —
+  контракт перечислял эти имена в общем ряду, а код держал их отдельной
+  осью. Одна ось вместо полутора.
+*/
 
 /** Короткий секрет создаёт видимость защиты, поэтому он не секрет, а ошибка настройки. */
 export const MIN_ADMIN_TOKEN_LENGTH = 24;
@@ -102,7 +131,12 @@ export function authorize(header: string | string[] | undefined, configured: str
   }
   const supplied = Array.isArray(header) ? header[0] : header;
   if (supplied === undefined || supplied === '') {
-    return { ok: false, code: 'unauthorized', status: 401, detail: 'no-token' };
+    return {
+      ok: false,
+      code: 'no-token',
+      status: 401,
+      detail: 'заголовок x-mds-admin-token не прислан',
+    };
   }
   const a = Buffer.from(supplied, 'utf8');
   const b = Buffer.from(configured, 'utf8');
@@ -110,7 +144,9 @@ export function authorize(header: string | string[] | undefined, configured: str
   // разной длины), поэтому сравниваем её отдельно и явно, а содержимое — за
   // постоянное время.
   const equal = a.length === b.length && timingSafeEqual(a, b);
-  return equal ? { ok: true } : { ok: false, code: 'unauthorized', status: 401, detail: 'bad-token' };
+  return equal
+    ? { ok: true }
+    : { ok: false, code: 'bad-token', status: 401, detail: 'секрет не совпал' };
 }
 
 export interface AdminView {
@@ -153,6 +189,31 @@ export type UpdateOutcome =
   | { ok: false; status: 400 | 409 | 503; code: AdminCode; detail: string };
 
 /**
+ * Что нужно, чтобы судить о безопасности правки, и чего в самом реестре нет.
+ *
+ * Запрет узкий сознательно (решение штаба 25.10): он отклоняет **смену
+ * личности ведущего**, то есть измеренный путь, которым правка данных
+ * подменяет источник живому символу. Он НЕ отклоняет «у символа стало
+ * больше одного кандидата» — возможность смены. Та проверка осталась в
+ * долге и понадобится в день, когда каталог научится ссылаться на источник
+ * данными; сегодня она целилась бы в путь, которым пройти нельзя.
+ */
+export interface RoutingGuard {
+  /**
+   * Каталог. Без него судить нечем: «кто ведёт символ» — свойство реестра
+   * **×** каталога, а не реестра.
+   */
+  catalog: CatalogInstrument[];
+  /**
+   * Снят ли запрет. **Умолчание — запрещено** (`false`): переключатель,
+   * открытый по умолчанию, — это отсутствующий запрет с видимостью запрета.
+   * Снимается переменной окружения, а не выкаткой: иначе мы меняем один
+   * деплой на другой ровно тогда, когда витрина будет готова.
+   */
+  allowIdentityChange: boolean;
+}
+
+/**
  * Приём изменения реестра. Чистая функция: вход — текущее состояние и тело
  * запроса, выход — либо новый реестр, либо названный отказ.
  *
@@ -165,6 +226,7 @@ export function applyRegistryUpdate(
   current: Registry | null,
   body: unknown,
   meta: { now: Date; actor: string },
+  guard: RoutingGuard,
 ): UpdateOutcome {
   if (current === null) {
     return {
@@ -209,6 +271,37 @@ export function applyRegistryUpdate(
       .map((i) => `${i.path.join('.') || '(корень)'}: ${i.message}`)
       .join('; ');
     return { ok: false, status: 400, code: 'invalid-registry', detail: issues };
+  }
+
+  /*
+    Последний барьер, и он не про форму тела, а про последствие правки.
+    Стоит ПОСЛЕ разбора сознательно: судить о маршрутизации можно только по
+    реестру, прошедшему схему, — иначе предикат считал бы по мусору.
+
+    Отказ, а не предупреждение: правка, уже применённая, разрывает ряд у
+    живого символа, и «мы об этом написали в журнал» делу не помогает.
+  */
+  if (!guard.allowIdentityChange) {
+    const changes = leaderIdentityChanges(guard.catalog, current, parsed.data);
+    if (changes.length > 0) {
+      const named = changes
+        .slice(0, 5)
+        .map((c) => `${c.symbol}: ${c.from} → ${c.to}`)
+        .join('; ');
+      const more = changes.length > 5 ? ` (и ещё ${changes.length - 5})` : '';
+      return {
+        ok: false,
+        status: 409,
+        code: 'routing-identity-change',
+        detail:
+          `правка меняет личность ведущего источника у ${changes.length} символов — ${named}${more}. ` +
+          'Смена источника на живом символе — РАЗРЫВ РЯДА, а потребитель показывает её очередным ' +
+          'тиком, то есть скачком цены как движением рынка. Запрет снимается переменной ' +
+          'MDS_ALLOW_ROUTING_IDENTITY_CHANGE=true, когда потребитель научится показывать разрыв. ' +
+          'Оговорка: предикат считается по ЖИВОМУ каталогу — вселенная биржи меняется сама, ' +
+          'и правка, принятая вчера, может быть отклонена сегодня без изменений в самой правке.',
+      };
+    }
   }
 
   return { ok: true, registry: parsed.data };
