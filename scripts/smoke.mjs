@@ -52,11 +52,25 @@ if (!['contract', 'live', 'all'].includes(MODE)) {
 }
 
 /**
- * Метка поддельного апстрима. Та же пара значений задана в
+ * Метка поддельного апстрима. Те же значения заданы в
  * `scripts/fake-binance.mjs`; расхождение двух мест ловится самой проверкой
  * `fake`, а не вниманием читателя.
  */
-const FAKE_MARKER = { symbol: 'FAKEUSD', price: 777.77, changePercent: 0.11 };
+const FAKE_MARKER = {
+  symbol: 'FAKEUSD',
+  price: 777.77,
+  changePercent: 0.11,
+  bid: 777.7,
+  ask: 777.84,
+};
+
+/**
+ * Метка пути «цена есть, стакана нет» (MDS-12). Символ, у которого лучших
+ * цен нет никогда — так выглядит всё от второго поставщика. Цена не
+ * сверяется: ряд движется, и важно, что цена **есть**, а лучшие цены
+ * **присутствуют пустыми**.
+ */
+const FAKE_NOBOOK_MARKER = { symbol: 'NOBOOKUSD' };
 
 /**
  * `contract` — не зависит от биржи, блокирует пуш;
@@ -111,6 +125,51 @@ for (let i = 0; i < 30; i++) {
 
 const binance = health?.providers?.find((p) => p.name === 'binance');
 
+/*
+  Достижим ли источник вообще — решение штаба 25.10.
+
+  **Недостижимость источника — невыполнение, а не расхождение.** Первый
+  ночной прогон пришёл красным, и красный этот двусмыслен по построению:
+  «биржа не ответила раннеру» и «биржа ответила не тем» выглядят
+  одинаково. Неразделённый исход — не строгость, а потеря обоих сигналов:
+  у красного, приходящего каждую ночь по чужой вине, не будет читателя на
+  третью ночь. Это ровно та ложная тревога, против которой мы сами писали
+  правило.
+
+  Зелёным оно при этом НЕ становится: «неизвестно» не равно «хорошо».
+
+  **Признак наблюдаемый, а не предполагаемый.** Спрашиваем не «смогли ли
+  мы достучаться до биржи» — мы до неё и не ходим, — а «получила ли от неё
+  служба хоть что-нибудь»:
+
+   - каталог приехал по HTTP (`catalogSource` не запасной) — значит сеть
+     до биржи есть;
+   - был хотя бы один тик по WS с запуска (`lastTickAgeMs` — число).
+
+  Недостижимость объявляется, только когда не пришло **ни то, ни другое**.
+  Приехал каталог, а тиков нет — сеть работает, и молчание потока это
+  настоящая находка, а не чужая вина: такое обязано краснеть.
+
+  И отдельно: «ни одного тика с запуска» — не то же, что «тики были и
+  протухли». Второе означает, что биржа отвечала и перестала, и это тоже
+  расхождение, а не невыполнение.
+*/
+const catalogArrived = health?.catalog?.source === 'binance-exchange-info';
+const everTicked = typeof binance?.lastTickAgeMs === 'number';
+const sourceUnreachable = !catalogArrived && !everTicked;
+const unreachableWhy =
+  `служба не получила от источника ничего: каталог=${health?.catalog?.source ?? '(ответа нет)'}, ` +
+  'тиков с запуска 0';
+
+/**
+ * Живая проверка. Если источник недостижим, её предмет отсутствует — она
+ * объявляется НЕ ВЫПОЛНЕННОЙ, а не проваленной.
+ */
+const checkLive = (ok, label) => {
+  if (sourceUnreachable) unexecuted('live', label, unreachableWhy);
+  else check('live', ok, label);
+};
+
 // Форма ответа. От биржи не зависит ничем — именно здесь месяц жил красный
 // дефект (убрали поле, смоук продолжал его сверять), и именно поэтому это
 // блокирующая половина, а не неблокирующая.
@@ -127,8 +186,7 @@ check(
 // Живость меряем тем же, чем её меряет сервис: свежими котировками.
 // Состояния сокета в ответе нет и не будет — поле, способное соврать, хуже
 // отсутствующего (B-003).
-check(
-  'live',
+checkLive(
   (binance?.fresh ?? 0) > 0,
   `health: status=${health?.status}, binance свежих ${binance?.fresh}/${binance?.quoted}, ` +
     `возраст последнего тика ${binance?.lastTickAgeMs} мс`,
@@ -158,8 +216,7 @@ check(
 
 const snap = await (await fetch(`${MDS}/v1/quotes?symbols=BTCUSD,ETHUSD`)).json();
 const btc = snap.items?.find((q) => q.symbol === 'BTCUSD');
-check(
-  'live',
+checkLive(
   Boolean(btc && btc.price > 1000 && Number.isFinite(btc.changePercent) && btc.source),
   `REST снапшот: BTCUSD=${btc?.price} (${btc?.changePercent}%), источник=${btc?.source}`,
 );
@@ -175,6 +232,39 @@ check(
   fakeQuote?.price === FAKE_MARKER.price && fakeQuote?.changePercent === FAKE_MARKER.changePercent,
   `апстрим ПОДДЕЛЬНЫЙ и опознан: ${FAKE_MARKER.symbol}=${fakeQuote?.price} ` +
     `(${fakeQuote?.changePercent}%) — у боевого Binance такого актива нет`,
+);
+
+// Лучшие цены доезжают от кадра апстрима до тела ручки (MDS-12). Проверка
+// сквозная нарочно: разбор, показанный у провайдера, ничего не говорит о
+// том, что поле уцелело в хабе и в сериализации. Режим `contract`: значения
+// заданы подделкой, от биржи не зависят, и расхождение обязано блокировать
+// пуш.
+check(
+  'contract',
+  fakeQuote?.bid === FAKE_MARKER.bid && fakeQuote?.ask === FAKE_MARKER.ask,
+  `лучшие цены доехали из кадра в ответ: bid=${fakeQuote?.bid} ask=${fakeQuote?.ask}`,
+);
+
+/*
+  Вторая половина: цена без стакана — законный исход, а не отказ.
+
+  Проверяется на символе, у которого стакана нет НИКОГДА — так выглядит всё,
+  что приходит от второго поставщика. Ловить редкую точку в движущемся ряду
+  опросом здесь уже пробовали: ряд шагает каждые 200 мс, опрос шёл каждые
+  400 мс, выборка стабильно попадала на чётные шаги, и проверка не
+  срабатывала НИ РАЗУ, выглядя при этом «иногда невезучей».
+
+  Поля обязаны ПРИСУТСТВОВАТЬ, а не исчезать: пропавшее поле потребитель
+  прочитает как «сосед ещё не шлёт», пустое — как «шлёт, и у него этого
+  нет». Это разные сообщения, и путать их нельзя.
+*/
+const nbBody = await (await fetch(`${MDS}/v1/quotes?symbols=${FAKE_NOBOOK_MARKER.symbol}`)).json();
+const nb = nbBody.items?.[0];
+check(
+  'contract',
+  Boolean(nb) && nb.price > 0 && 'bid' in nb && 'ask' in nb && nb.bid === null && nb.ask === null,
+  `цена без стакана — законный исход: ${FAKE_NOBOOK_MARKER.symbol}=${nb?.price}, ` +
+    `bid=${JSON.stringify(nb?.bid)} ask=${JSON.stringify(nb?.ask)} (поля на месте, значения пусты)`,
 );
 
 // Недоступный символ обязан называть причину, а не молча отсутствовать.
@@ -234,15 +324,20 @@ check(
 
 // живой батч после снапшота (реальный тик Binance долетает за секунды)
 if (inScope('live')) {
-  const liveBatch = await Promise.race([
-    new Promise((resolve) => socket.once('quotes:batch', resolve)),
-    new Promise((r) => setTimeout(() => r(null), 20000)),
-  ]);
-  check(
-    'live',
-    Array.isArray(liveBatch) && liveBatch.every((q) => ['BTCUSD', 'ETHUSD'].includes(q.symbol)),
-    `WS: живой батч (${liveBatch?.map((q) => `${q.symbol}=${q.price}`).join(', ')})`,
-  );
+  if (sourceUnreachable) {
+    // Не ждём двадцати секунд того, чего заведомо не будет: ожидание
+    // тишины от недостижимого источника — не проверка, а задержка.
+    unexecuted('live', 'WS: живой батч', unreachableWhy);
+  } else {
+    const liveBatch = await Promise.race([
+      new Promise((resolve) => socket.once('quotes:batch', resolve)),
+      new Promise((r) => setTimeout(() => r(null), 20000)),
+    ]);
+    checkLive(
+      Array.isArray(liveBatch) && liveBatch.every((q) => ['BTCUSD', 'ETHUSD'].includes(q.symbol)),
+      `WS: живой батч (${liveBatch?.map((q) => `${q.symbol}=${q.price}`).join(', ')})`,
+    );
+  }
 } else {
   outOfScope.push('WS: живой батч');
 }
@@ -264,6 +359,15 @@ socket.close();
 /* ------------------------------------------------------------------ */
 
 console.log(`\n--- смоук, режим ${MODE} ---`);
+// Причину называем ОДИН раз и первой строкой, а не по разу на проверку:
+// три одинаковых «не выполнено» читаются как три разных беды.
+if (sourceUnreachable && inScope('live')) {
+  console.log(
+    'ИСТОЧНИК НЕДОСТИЖИМ — живые проверки не выполнялись, их предмета нет. ' +
+      'Это НЕ расхождение с биржей и НЕ успех: результат неизвестен. ' +
+      `Признак: ${unreachableWhy}.`,
+  );
+}
 if (notExecuted.length > 0) {
   console.log(`НЕ ВЫПОЛНЕНО ${notExecuted.length} — результат по ним НЕИЗВЕСТЕН:`);
   for (const label of notExecuted) console.log(` - ${label}`);
