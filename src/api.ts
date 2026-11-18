@@ -2,85 +2,26 @@ import type { SnapshotResult } from './hub.js';
 import type { RouteReason } from './registry.js';
 import type { RegistryOrigin } from './registry-store.js';
 
-/**
- * Тела ответов `/health` и `/v1/quotes` — чистыми функциями, отдельно от
- * HTTP-обвязки. Причина не в красоте: `index.ts` — скрипт верхнего уровня
- * (top-level await за каталогом, `listen`), импортировать его в тест нельзя,
- * и до сих пор ровно та логика, из-за которой случился B-003, не могла быть
- * покрыта ничем.
- */
-
-/** Что провайдер сообщает о себе. Состояния сокета здесь нет сознательно. */
 export interface ProviderView {
   name: string;
-  /** Момент последнего ОПОЗНАННОГО тика, unix ms. 0 — тиков не было. */
   lastTickAt: number;
 }
 
-/**
- * Состояние реестра провайдеров для `/health`. Обязательное поле, а не
- * необязательное: необязательное оставило бы ту же дыру — вызов, забывший
- * его передать, молча отчитывался бы о здоровье сервиса, не взглянув на то,
- * настроены ли у него источники вообще.
- */
 export interface RegistryHealthInput {
   origin: RegistryOrigin;
   error?: string;
-  /** `null` ровно и только при `origin === 'error'`. */
   version: number | null;
   providers: { id: string; enabled: boolean; silent: boolean }[];
-  /**
-   * Сколько символов сейчас кому-то назначено и сколько осмотрено всего.
-   *
-   * `null` — **маршрутизации нет вовсе** (реестр не прочитан), то есть мы
-   * не считали. Раньше здесь стоял `0`, а это другой ответ: «считали,
-   * назначенных ноль». Охват, объявленный нулём вместо «неизвестно», — это
-   * `empty` на месте `missing`, и ровно так «нечего было проверять»
-   * превращается в «проверено».
-   *
-   * Поправка 20.10 (QA-05, вторая половина): **два ответа одного сервиса
-   * про одну величину обязаны говорить одинаково.** `/v1/instruments` ту же
-   * величину отдаёт правильно — `coverage: null` при отсутствии таблицы — и
-   * делал это с самого начала. Правильный ответ рядом с неправильным не
-   * спасает, а маскирует: проверяющий смотрит на один из двух и видит
-   * порядок.
-   */
   routed: number | null;
   checked: number | null;
-  /**
-   * Символов, у которых кандидатов в источники больше одного (Р-317).
-   * `null` — маршрутизации нет, то есть **не считали**, а не «насчитали
-   * ноль»: та же разница, что у `routed`.
-   *
-   * Поле стоит в ответе, а не только в журнале, по правилу «мера, не
-   * доезжающая до читателя, не существует»: крик в `stdout` видит тот, кто
-   * в него смотрит, а число в `/health` — наблюдение.
-   *
-   * **Почему это НЕ переводит службу в `degraded`.** `degraded` отвечает
-   * `503`, то есть снимает MDS с раздачи. Снимать сервис, у которого цены
-   * идут исправно, из-за настройки — хуже самого дефекта, и такую тревогу
-   * отключат первой. Поэтому тревога здесь — величина плюс отдельная строка
-   * `warning`, а не состояние службы.
-   */
   multiCandidate: number | null;
-  /**
-   * Включённые источники, которым нужен ключ, а ключа нет. Такой источник
-   * не запущен вовсе, и без отдельного поля он выглядел бы просто молчащим —
-   * то есть отказ настройки был бы неотличим от отказа сети.
-   */
   missingKeys: string[];
 }
 
 export interface HealthInput {
-  /** Возрасты котировок в памяти — источник правды о живости сервиса. */
   ages: { symbol: string; ageMs: number }[];
   providers: ProviderView[];
-  /** Канонический символ → провайдер, для разбивки возрастов. */
   providerOf: Map<string, string>;
-  /**
-   * Провайдер, по которому судим о здоровье сервиса целиком. Twelve Data —
-   * поллер: между опросами его молчание штатно и деградацией не является.
-   */
   primaryProvider: string;
   staleAfterMs: number | null;
   catalog: { source: string; instruments: number };
@@ -93,28 +34,16 @@ export interface HealthInput {
 export interface ProviderHealth {
   name: string;
   lastTickAt: number;
-  /** Возраст последнего тика, мс. `null` — тиков не было ни одного. */
   lastTickAgeMs: number | null;
-  /** Сколько символов этого провайдера есть в памяти. */
   quoted: number;
-  /** Сколько из них свежее порога. `null` — порога нет, не считали. */
   fresh: number | null;
   stale: number | null;
-  /** Возраст самой старой котировки провайдера, мс. */
   oldestQuoteAgeMs: number | null;
 }
 
 export interface HealthBody {
   status: 'ok' | 'degraded';
   reason?: string;
-  /**
-   * Тревога, которая **не снимает сервис с раздачи**. `reason` объясняет
-   * `degraded` и приходит с `503`; `warning` приходит с любым статусом,
-   * в том числе с `ok`, и означает «работает, но смотреть сюда».
-   *
-   * Разделение намеренное: сведя их в одно поле, мы получили бы выбор между
-   * «молчать о беде» и «останавливать исправную службу», и оба плохи.
-   */
   warning?: string;
   quotes: { staleAfterMs: number | null; total: number; fresh: number | null };
   providers: ProviderHealth[];
@@ -125,13 +54,6 @@ export interface HealthBody {
   time: string;
 }
 
-/**
- * `/health`. Судит о провайдере по **возрасту данных**, а не по состоянию
- * сокета (B-003): открытый сокет ничего не говорит о наличии котировок, и
- * один раз принятый за признак жизни будет принят снова. Состояние сокета
- * наружу не отдаётся вовсе — по той же причине, по какой у терминала убрали
- * зелёную точку: поле, способное соврать, хуже отсутствующего.
- */
 export function buildHealth(input: HealthInput): { httpStatus: 200 | 503; body: HealthBody } {
   const now = input.now ?? Date.now();
   const { staleAfterMs } = input;
@@ -163,14 +85,6 @@ export function buildHealth(input: HealthInput): { httpStatus: 200 | 503; body: 
   const registry = input.registry;
   const enabledProviders = registry.providers.filter((p) => p.enabled);
 
-  // Порядок причин — от «мы не знаем, чем работать» к «работаем, но плохо».
-  // Каждая ветка — своё состояние; ни одна из них не «ноль инструментов».
-  //
-  // Три состояния реестра, которые нельзя сливать в одно:
-  //   error            — реестр не прочитан, чем работать неизвестно;
-  //   пустой реестр    — прочитан, источников в нём нет ни одного;
-  //   всё выключено    — источники есть, включённых нет.
-  // Снаружи это три разных ответа, потому что чинят их по-разному.
   const reason =
     registry.origin === 'error'
       ? `реестр провайдеров не прочитан (${registry.error ?? 'причина не названа'}) — источники не запущены`
@@ -192,8 +106,6 @@ export function buildHealth(input: HealthInput): { httpStatus: 200 | 503; body: 
                   ? `у ${primary.name} нет ни одной котировки свежее ${staleAfterMs} мс`
                   : null;
 
-  // Тревога считается ОТДЕЛЬНО от `reason` и статуса — см. `warning`.
-  // `null` не тревожит: «не считали» — это не «насчитали много».
   const warning =
     registry.multiCandidate !== null && registry.multiCandidate > 0
       ? `у ${registry.multiCandidate} символов больше одного кандидата в источники: ` +
@@ -221,48 +133,25 @@ export function buildHealth(input: HealthInput): { httpStatus: 200 | 503; body: 
   return { httpStatus: reason === null ? 200 : 503, body };
 }
 
-/**
- * Почему символа нет в ответе. Коды машинные и **не переводятся**: подпись
- * для человека и признак для машины — разные поля.
- *
- * До Р-047 все эти случаи выглядели снаружи одинаково — символа просто нет в
- * `items`. То есть «источник выключен оператором», «источник молчит»,
- * «такого инструмента у нас нет» и «цена протухла» были неразличимы, и
- * потребитель мог прочитать любой из них как «пока не приехало».
- */
 export const UNAVAILABLE_REASONS = [
-  /** Порог свежести не задан — судить о свежести нечем, не отдаём ничего. */
   'threshold-unset',
-  /** Цена есть, но старше порога. */
   'stale',
-  /** Источник назначен и включён, но цены от него нет (ещё или уже). */
   'source-silent',
-  /** Источники для символа есть, но все выключены в реестре. */
   'source-disabled',
-  /** Ни один источник реестра не ведёт этот символ. */
   'no-source',
-  /** Символа нет во вселенной MDS вообще. */
   'not-in-catalog',
-  /** Реестр не прочитан — маршрутизации нет, работать нечем. */
   'registry-unreadable',
 ] as const;
 
 export type UnavailableReason = (typeof UNAVAILABLE_REASONS)[number];
 
-/** Что маршрутизация знает о символах. `readable: false` — реестра нет вовсе. */
 export interface QuotesRouting {
   readable: boolean;
   reasons: Map<string, RouteReason>;
 }
 
 export interface QuotesBody extends SnapshotResult {
-  /** Порог, по которому решено, что протухло. `null` — порога нет. */
   staleAfterMs: number | null;
-  /**
-   * Символы, которых в `items` нет, с названной причиной по каждому.
-   * Это главное, что реестр добавил к ответу: отсутствие строки перестало
-   * быть единственным сообщением обо всех отказах сразу.
-   */
   unavailable: { symbol: string; reason: UnavailableReason }[];
   reason?: string;
 }
@@ -276,24 +165,12 @@ function routeToUnavailable(reason: RouteReason | undefined): UnavailableReason 
     case 'primary':
     case 'failover':
     case 'silent':
-      // Маршрут есть, цены нет: источник назначен, но молчит — это не то же
-      // самое, что «источника нет», и чинится другим.
       return 'source-silent';
     default:
       return 'not-in-catalog';
   }
 }
 
-/**
- * `/v1/quotes`. Протухшие котировки не отдаются **вовсе** — ни нулём, ни
- * старым значением (решение штаба, КОНТРАКТЫ.md §5б). Рядом с `items` идут
- * список протухших символов и порог, по которому это решено: без них
- * потребитель не отличит «MDS считает всё свежим» от «MDS не считает вовсе».
- *
- * `requested` — символы, которые спросили явно; `null` — спросили всё.
- * Разница важна: в первом случае отвечать надо про каждый спрошенный символ
- * (включая неизвестные), во втором — про всю вселенную маршрутизации.
- */
 export function buildQuotes(
   snapshot: SnapshotResult,
   staleAfterMs: number | null,
@@ -304,8 +181,6 @@ export function buildQuotes(
   const fresh = new Set(snapshot.items.map((q) => q.symbol));
 
   if (!routing.readable) {
-    // Реестр не прочитан: причина у всех одна, и она блокирующая. Подменять
-    // её на «источник молчит» значило бы отправить чинить не то.
     for (const symbol of requested ?? [...routing.reasons.keys()]) {
       unavailable.push({ symbol, reason: 'registry-unreadable' });
     }
@@ -327,8 +202,6 @@ export function buildQuotes(
       unavailable.push({ symbol, reason: 'threshold-unset' });
       continue;
     }
-    // Цена в памяти есть, но не прошла порог — это `stale`, и перепутать её
-    // с «источник молчит» нельзя: у них разные виноватые.
     unavailable.push({
       symbol,
       reason: snapshot.staleSymbols?.includes(symbol)
@@ -340,11 +213,7 @@ export function buildQuotes(
   return {
     items: snapshot.items,
     staleAfterMs,
-    // `null` ≠ `[]`: пустой массив — «считали, протухших не нашли»,
-    // null — «источник ничего не сказал» (§5г, требование 1).
     staleSymbols: snapshot.staleSymbols,
-    // Охват проверки: без него «протухших нет» неотличимо от «проверять
-    // было нечего».
     checked: snapshot.checked,
     missing: snapshot.missing,
     unavailable,

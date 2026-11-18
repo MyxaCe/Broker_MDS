@@ -16,16 +16,6 @@ import {
 import { loadRegistry, saveRegistry } from './registry-store.js';
 import type { CatalogInstrument } from './types.js';
 
-/**
- * Реестр провайдеров (Р-047), чистая часть: кто что ведёт и почему.
- *
- * Данные подобраны так, чтобы их было чем сломать: один символ с одним
- * источником, один символ с двумя источниками одной категории (настоящие
- * «два провайдера на один символ»), один символ-коллизия двух разных
- * категорий и один символ, который не ведёт никто. Вырожденный набор
- * «по одному источнику на всё» дал бы зелёный цвет при любой формуле выбора.
- */
-
 function instrument(over: Partial<CatalogInstrument> & Pick<CatalogInstrument, 'symbol' | 'provider'>): CatalogInstrument {
   return {
     name: over.symbol,
@@ -38,15 +28,11 @@ function instrument(over: Partial<CatalogInstrument> & Pick<CatalogInstrument, '
 }
 
 const CATALOG: CatalogInstrument[] = [
-  // один источник
   instrument({ symbol: 'BTCUSD', provider: 'binance' }),
-  // два источника одной категории — настоящий случай «или несколько»
   instrument({ symbol: 'XAUUSD', provider: 'twelvedata', category: 'metals' }),
   instrument({ symbol: 'XAUUSD', provider: 'metals-alt', category: 'metals' }),
-  // коллизия канонического имени между РАЗНЫМИ категориями
   instrument({ symbol: 'EURUSD', provider: 'binance', category: 'crypto' }),
   instrument({ symbol: 'EURUSD', provider: 'twelvedata', category: 'forex' }),
-  // категории нет ни у кого в covers
   instrument({ symbol: 'BRENT', provider: 'twelvedata', category: 'energy' }),
 ];
 
@@ -80,7 +66,6 @@ describe('реестр · два провайдера на один символ
     const route = table.routes.get('XAUUSD')!;
     expect(route.leader?.providerId).toBe('twelvedata');
     expect(route.reason).toBe('primary');
-    // Запасной не исчезает: он виден кандидатом, а не «берём первого молча».
     expect(route.candidates.map((c) => c.providerId)).toEqual(['twelvedata', 'metals-alt']);
   });
 
@@ -102,9 +87,6 @@ describe('реестр · два провайдера на один символ
   });
 
   it('автоматического возврата нет: основной ожил, но ведёт прежний запасной', () => {
-    // Это РЕШЕНИЕ, а не недоделка (ADR-031): возврат дал бы второй разрыв
-    // цены и дребезг на неустойчивом канале. Тест-растяжка — чтобы
-    // «дозакрывающий полноту» увидел, что молчание здесь намеренное.
     const table = resolveRouting(CATALOG, registry(), {
       silent: new Set(),
       sticky: new Map([['XAUUSD', 'metals-alt']]),
@@ -130,19 +112,13 @@ describe('реестр · два провайдера на один символ
     });
     const route = table.routes.get('XAUUSD')!;
     expect(route.reason).toBe('silent');
-    // Не `no-source` и не `source-disabled`: источник есть и включён, он молчит.
     expect(route.leader).not.toBeNull();
   });
 });
 
 describe('реестр · тревога «кандидатов больше одного» (Р-317)', () => {
   it('число считается и называется, а не подразумевается нулём', () => {
-    // Ноль, которого не считали, неотличим от нуля измеренного. Здесь
-    // величина заведомо НЕ ноль: вырожденная фикстура дала бы зелёный цвет
-    // при любой формуле подсчёта.
     const summary = summarizeRouting(resolveRouting(CATALOG, registry(), quiet));
-    // XAUUSD — единственный символ с двумя кандидатами. У EURUSD кандидат
-    // один: столкновение имён решено категорией ДО выбора источника.
     expect(summary.multiCandidate).toBe(1);
   });
 
@@ -160,10 +136,6 @@ describe('реестр · тревога «кандидатов больше о�
 
 describe('реестр · смена ЛИЧНОСТИ ведущего, а не числа кандидатов (Р-318)', () => {
   it('перестановка приоритета категорий меняет личность, а число кандидатов — нет', () => {
-    // Измеренный 25.10 путь: единственный способ правкой ДАННЫХ подменить
-    // источник живому символу. Кандидат у EURUSD один и до, и после —
-    // поэтому слабая форма («стало больше одного кандидата») молчит здесь
-    // полностью, а сторож обязан сработать. Это и есть довод за личность.
     const before = registry();
     const after = registry({
       categoryPrecedence: ['crypto', 'forex', 'metals', 'indices', 'stocks', 'energy'],
@@ -210,14 +182,6 @@ describe('реестр · смена ЛИЧНОСТИ ведущего, а не 
 });
 
 describe('реестр · подмена ИНСТРУМЕНТА под постоянным именем (Р-356)', () => {
-  /*
-    Второй сторож отвечает на ДРУГОЙ вопрос: не «кто даёт цену», а «что
-    означает имя». Проверяется прежде всего то, на чём первый слеп, —
-    случай, где прежнего ряда не было.
-
-    Фикстура годится: `EURUSD` есть и крипто-строкой (binance), и
-    форексной (twelvedata), а precedence решает, какая стоит за именем.
-  */
   const flipped = () =>
     registry({ categoryPrecedence: ['crypto', 'forex', 'metals', 'indices', 'stocks', 'energy'] });
 
@@ -235,9 +199,6 @@ describe('реестр · подмена ИНСТРУМЕНТА под пост�
   });
 
   it('ловится и когда РЯДА НЕ БЫЛО — вот чего не умеет сосед', () => {
-    // Второй поставщик выключен: цены у EURUSD нет вовсе, прежнего
-    // ведущего нет. Сосед молчит законно, а актив всё равно подменяется.
-    // Это ровно случай стенда 25.10.
     const off = withTwelveOff(registry());
     const offFlipped = withTwelveOff(flipped());
     expect(leaderIdentityChanges(CATALOG, off, offFlipped)).toEqual([]);
@@ -245,9 +206,6 @@ describe('реестр · подмена ИНСТРУМЕНТА под пост�
   });
 
   it('называет обе стороны подмены, а не только то, что «нельзя»', () => {
-    // Отказ без имён отправляет чинить вслепую. В тексте обязаны быть
-    // ОБЕ стороны: и символ у источника, и сам источник, и категория —
-    // иначе «инструмент подменился» неотличимо от «что-то изменилось».
     const c = symbolInstrumentChanges(CATALOG, registry(), flipped())[0]!;
     for (const part of ['eurusd', 'forex', 'twelvedata']) expect(c.from).toContain(part);
     for (const part of ['eurusd', 'crypto', 'binance']) expect(c.to).toContain(part);
@@ -297,7 +255,6 @@ describe('реестр · отключённый источник и пусто�
     const route = table.routes.get('XAUUSD')!;
     expect(route.reason).toBe('source-disabled');
     expect(route.leader).toBeNull();
-    // Символ не исчез: «инструмента нет» и «источник выключен» — разное.
     expect(table.routes.has('XAUUSD')).toBe(true);
   });
 
@@ -327,7 +284,6 @@ describe('реестр · коллизия канонического имени
     const route = table.routes.get('EURUSD')!;
     expect(route.category).toBe('forex');
     expect(route.leader?.providerId).toBe('twelvedata');
-    // Проигравшая запись названа, а не растворилась в console.info.
     expect(route.hiddenByCollision).toEqual([{ providerId: 'binance', category: 'crypto' }]);
   });
 
@@ -349,7 +305,6 @@ describe('реестр · что забывать при переключени�
     const after = resolveRouting(CATALOG, reg, quiet);
 
     const { invalidate, changed } = diffRouting(before, after);
-    // XAUUSD сменил источник, BTCUSD и EURUSD его потеряли — всё это забываем.
     expect(invalidate.sort()).toEqual(['BTCUSD', 'EURUSD', 'XAUUSD']);
     expect(changed.find((c) => c.symbol === 'XAUUSD')).toEqual({
       symbol: 'XAUUSD',
@@ -392,7 +347,6 @@ describe('реестр · разбор строгий, потому что эт�
   });
 
   it('пустой список провайдеров — валидное состояние, а не ошибка', () => {
-    // Пустой реестр законен и обязан быть отличим от сломанного.
     expect(registrySchema.safeParse({ ...builtinRegistry(), providers: [] }).success).toBe(true);
   });
 });
@@ -451,10 +405,6 @@ describe('хранилище реестра · три исхода загруз�
   });
 });
 
-/** Тише воды: `chmodSync` на Windows прав не меняет, поэтому сценарий
- *  «файл есть, но читать нельзя» живым прогоном здесь не воспроизводится.
- *  Записано прямо в тесте, чтобы следующий не счёл пункт забытым и не
- *  дописал проверку, которая на этой машине зелёная по совпадению. */
 describe.skip('хранилище реестра · нет прав на чтение (не воспроизводится на Windows)', () => {
   it('ENOACCES → error', () => {
     expect(chmodSync).toBeTypeOf('function');

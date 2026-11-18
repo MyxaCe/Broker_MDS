@@ -4,18 +4,6 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { BinanceProvider, normalizeTick } from './binance.js';
 import type { CatalogInstrument, Quote } from '../types.js';
 
-/**
- * Провайдер Binance против **поддельного источника** (MDS-04).
- *
- * Починка, проверенная только чтением кода, не проверена: отказ, который
- * умеет воспроизводить только природа, здесь воспроизводится своим сервером.
- * Так и был пойман half-open (B-003) — соединение целое, кадров нет.
- *
- * Уборка висит на `afterEach`, а не в конце тела теста: упавшая проверка
- * иначе оставляет сокет и таймер живыми, и прогон **зависает вместо того,
- * чтобы покраснеть**. Зависание списывают на «что-то долго».
- */
-
 function instrument(symbol: string, providerSymbol: string): CatalogInstrument {
   return {
     symbol,
@@ -32,9 +20,7 @@ const UNIVERSE = [instrument('BTCUSD', 'btcusdt'), instrument('ETHUSD', 'ethusdt
 
 interface Fake {
   url: string;
-  /** Сообщения, пришедшие от провайдера (SUBSCRIBE/UNSUBSCRIBE). */
   received: { method: string; params: string[] }[];
-  /** Сколько раз к нам подключались: реконнект виден отсюда, а не из логов. */
   connections: number;
   send(payload: unknown): void;
   close(): Promise<void>;
@@ -72,7 +58,6 @@ async function fakeBinance(options: { autoRespond?: boolean } = {}): Promise<Fak
     socket.on('message', (raw) => {
       const parsed = JSON.parse(String(raw)) as { method: string; params: string[]; id: number };
       fake.received.push({ method: parsed.method, params: parsed.params });
-      // Ack подписки — ровно тот кадр, который НЕ должен считаться жизнью.
       if (options.autoRespond !== false) socket.send(JSON.stringify({ result: null, id: parsed.id }));
     });
   });
@@ -142,21 +127,14 @@ describe('BinanceProvider · живой поддельный источник', 
 
 describe('BinanceProvider · half-open: сокет цел, кадров нет (B-003)', () => {
   it('тишина дольше порога → соединение признано мёртвым и переподключение', async () => {
-    // Состояние, в котором дефект жил: сервер принял соединение и молчит.
-    // `close` не придёт никогда, поэтому реконнект по событию не сработает.
     const fake = await fakeBinance({ autoRespond: false });
     const { provider } = start(fake, { silenceMs: 600 });
     await until(() => fake.connections === 1);
     await until(() => provider.silenceReconnects >= 1);
-    // Связь меряется на стороне того, с кем связываются: второе подключение
-    // видно поддельному серверу, а не нашему логу.
     await until(() => fake.connections >= 2);
   });
 
   it('ack подписки жизнью не считается: он кадр, но не котировка', async () => {
-    // Живость отмечается на принятом и ОПОЗНАННОМ сообщении. Сервер исправно
-    // отвечает ack на подписку — если бы он продлевал жизнь, таймер тишины
-    // не сработал бы никогда и half-open вернулся бы незамеченным.
     const fake = await fakeBinance({ autoRespond: true });
     const { provider } = start(fake, { silenceMs: 600 });
     await until(() => fake.received.length > 0);
@@ -189,8 +167,6 @@ describe('BinanceProvider · переназначение набора на жи
     const methods = fake.received.map((m) => `${m.method}:${m.params.join(',')}`);
     expect(methods).toContain('UNSUBSCRIBE:ethusdt@ticker');
     expect(methods).toContain('SUBSCRIBE:solusdt@ticker');
-    // Переподключения не было: оно уронило бы и те символы, которых правка
-    // не касалась.
     expect(fake.connections).toBe(1);
   });
 
@@ -221,8 +197,6 @@ describe('normalizeTick · разбор и приведение — разные
   const bySymbol = new Map(UNIVERSE.map((i) => [i.providerSymbol, i]));
 
   it('строка "NaN" разбирается успешно, но пригодным значением не является', () => {
-    // Успешный разбор не означает пригодного значения: это ещё один путь к
-    // цене ноль мимо проверок «это вообще число?».
     expect(normalizeTick(ticker('BTCUSDT', 'NaN'), bySymbol, 'binance')).toBeNull();
   });
 
@@ -231,8 +205,6 @@ describe('normalizeTick · разбор и приведение — разные
   });
 
   it('нулевая цена от источника проходит — это не наш домысел, а его данные', () => {
-    // Намеренно: подменять отказом настоящий ноль источника мы не вправе.
-    // Мутацию «запретить ноль» писать не надо, она изменила бы смысл.
     expect(normalizeTick(ticker('BTCUSDT', '0'), bySymbol, 'binance')?.price).toBe(0);
   });
 });

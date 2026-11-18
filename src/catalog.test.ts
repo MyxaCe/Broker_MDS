@@ -24,7 +24,6 @@ describe('вселенная инструментов', () => {
     expect(crypto.every((i) => i.provider === 'binance')).toBe(true);
     const twelve = CATALOG.filter((i) => i.provider === 'twelvedata');
     expect(twelve.length).toBeGreaterThanOrEqual(17);
-    // Заявленная таксономия присутствует
     const has = (category: string, segment: string | null) =>
       CATALOG.some((i) => i.category === category && i.segment === segment);
     expect(has('forex', 'major') && has('forex', 'minor') && has('forex', 'exotic')).toBe(true);
@@ -65,9 +64,6 @@ describe('normalizeTwelveQuote (Twelve Data /quote → Quote контракта 
       price: 1.08543,
       digits: 5,
       changePercent: -0.25,
-      // Лучших цен источник не даёт вовсе — пустота, а не ноль (MDS-12).
-      // Это заявление: живой ответ `/quote` от 25.10 их не нёс, и в их
-      // спецификации `bid`/`ask` есть только в цепочке опционов.
       bid: null,
       ask: null,
       ts: 1784990000000,
@@ -79,8 +75,6 @@ describe('normalizeTwelveQuote (Twelve Data /quote → Quote контракта 
     const { normalizeTwelveQuote } = await import('./providers/twelvedata.js');
     const eurusd = CATALOG.find((i) => i.symbol === 'EURUSD')!;
     expect(normalizeTwelveQuote({ close: 'abc' }, eurusd, 'twelvedata')).toBeNull();
-    // До 20.10 здесь ожидался `changePercent === 0`. Отменено: поле
-    // окрашивается, и ноль со знаком читается как утверждение о рынке.
     expect(
       normalizeTwelveQuote({ close: '1.1', timestamp: 1784990000 }, eurusd, 'twelvedata'),
     ).toBeNull();
@@ -103,9 +97,6 @@ describe('normalizeTick (Binance @ticker → Quote контракта сайта
       price: 64034.52,
       digits: 0,
       changePercent: -1.497,
-      // Кадра без `b`/`a` на живом проводе мы не наблюдали ни разу, но
-      // «не наблюдали» — не «не бывает»: поля необязательные, и путь без
-      // них обязан проходиться.
       bid: null,
       ask: null,
       ts: 1784990000000,
@@ -118,16 +109,6 @@ describe('normalizeTick (Binance @ticker → Quote контракта сайта
     expect(normalizeTick({ e: '24hrTicker', E: 1, s: 'BTCUSDT', c: 'abc', P: '1' }, bySymbol, 'binance')).toBeNull();
   });
 
-  /*
-    Лучшие цены (MDS-12).
-
-    Образец — НАСТОЯЩИЙ кадр, снятый 25.10 с
-    `wss://stream.binance.com:9443/ws`, а не собранный нами. Поэтому в нём
-    стоят поля, которых разборщик не читает (`p`, `w`, `o`, `n` и прочие):
-    они тут не для красоты — именно так выглядит то, что приходит, и
-    именно на таком кадре надо показывать, что лишнее не мешает, а нужное
-    берётся.
-  */
   const LIVE_FRAME = {
     e: '24hrTicker',
     E: 1792933166015,
@@ -158,9 +139,6 @@ describe('normalizeTick (Binance @ticker → Quote контракта сайта
     const quote = normalizeTick(LIVE_FRAME, bySymbol, 'binance');
     expect(quote?.bid).toBe(80450.06);
     expect(quote?.ask).toBe(80450.07);
-    // И цена осталась ценой: `b` совпадает с `c` в этом кадре, поэтому
-    // перепутать их местами здесь нельзя — проверяем `ask`, который
-    // отличается от обоих.
     expect(quote?.price).toBe(80450.06);
   });
 
@@ -174,14 +152,11 @@ describe('normalizeTick (Binance @ticker → Quote контракта сайта
   });
 
   it('ноль и отрицательное отвергаются КАК ЗНАЧЕНИЕ, а не подставляются', () => {
-    // Нулевая цена покупки означала бы сделку по нулю. Отрицательная — то
-    // же с другой стороны. Ни то, ни другое не «спред нулевой».
     const zero = normalizeTick({ ...LIVE_FRAME, b: '0', a: '0.00000000' }, bySymbol, 'binance');
     expect(zero?.bid).toBeNull();
     expect(zero?.ask).toBeNull();
     const negative = normalizeTick({ ...LIVE_FRAME, b: '-1.5' }, bySymbol, 'binance');
     expect(negative?.bid).toBeNull();
-    // Вторая сторона при этом остаётся годной: барьеры у них раздельные.
     expect(negative?.ask).toBe(80450.07);
   });
 
@@ -194,9 +169,6 @@ describe('normalizeTick (Binance @ticker → Quote контракта сайта
   });
 
   it('перекрещённый стакан снимает ОБЕ стороны, а не выбирает наугад', () => {
-    // При `bid > ask` известно, что одна из величин неверна, и неизвестно
-    // какая. Оставить «похожую на правду» значило бы выдать выбор за
-    // знание. На живом рынке не встретилось ни разу (0 из 471 кадра).
     const quote = normalizeTick({ ...LIVE_FRAME, b: '80451', a: '80450' }, bySymbol, 'binance');
     expect(quote).not.toBeNull();
     expect(quote?.bid).toBeNull();

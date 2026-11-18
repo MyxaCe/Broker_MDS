@@ -1,14 +1,3 @@
-/**
- * Мутационный прогон: вернуть дефект в код и посмотреть, что покраснело.
- *
- * Тест засчитывается, когда показано, что он краснеет. Отдельно важен
- * раскол по наборам: класс «написано и не вызывается» модульными тестами не
- * ловится в принципе, поэтому мутации на ПРОВОДКУ обязаны краснеть в
- * интеграционном наборе, и вывод «мутация не покрасила» без указания набора
- * недействителен.
- *
- * Запуск: node scripts/mutate.mjs [подстрока-имени-мутации]
- */
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 
@@ -25,18 +14,6 @@ const INTEGRATION = [
   'src/providers/twelvedata.test.ts',
 ];
 
-/**
- * Перечень, который ведут руками, отстаёт молча: новый файл проверок не
- * попал бы ни в один набор, мутации гонялись бы без него, и узнать об этом
- * было бы неоткуда — ровно так одиннадцать свежих проверок терминала не
- * запускались бы в CI. Поэтому состав наборов СВЕРЯЕТСЯ С ДИСКОМ, и
- * расхождение здесь — отказ с кодом возврата, а не строчка предупреждения.
- *
- * Общий прогон (`pnpm test`) эту проблему не имеет: он зовёт команду
- * проекта, а она берёт все `*.test.ts`. Раскол на два набора нужен только
- * здесь, потому что вывод «мутация не покрасила» без указания набора
- * недействителен.
- */
 function assertSetsCoverDisk() {
   const onDisk = [];
   const SKIP = new Set(['node_modules', 'dist', '.git', '.github']);
@@ -48,12 +25,6 @@ function assertSetsCoverDisk() {
       else if (entry.name.endsWith('.test.ts')) onDisk.push(full);
     }
   };
-  // Обходим КОРЕНЬ, а не только `src`. Первая версия этого сторожа ходила
-  // по `src` — и файл проверок, положенный рядом (в `tests/`, в корне),
-  // был бы невидим и ему, и проверке типов: `tsconfig.test.json` тоже
-  // привязан к `src/**/*.ts`. Прогон (`vitest run`) при этом подхватил бы
-  // его откуда угодно. Сторож, слепой ровно там, где слеп охват, не
-  // сторож.
   walk('.');
   const classified = new Set([...UNIT, ...INTEGRATION]);
   const unclassified = onDisk.filter((f) => !classified.has(f));
@@ -68,7 +39,6 @@ function assertSetsCoverDisk() {
   console.log(`Наборы сверены с диском: файлов проверок ${onDisk.length}, все отнесены.`);
 }
 
-/** @type {{name: string, file: string, from: string, to: string, expect: string}[]} */
 const MUTATIONS = [
   {
     name: 'проводка: переключение не забывает цену прежнего источника',
@@ -327,27 +297,12 @@ const MUTATIONS = [
   },
 ];
 
-/**
- * Прогон набора под мутацией.
- *
- * Возвращает не только число красных, но и ИМЕНА красных проверок: красный
- * без указания, какая опора покраснела, значит не больше зелёного. У зоны
- * `deploy` три мутации покраснели не по той причине — сторож переводов
- * строки срабатывал первым и обрывал прогон до самой проверки.
- *
- * Исходов ТРИ, а не два: зелено · покраснело · РЕЗУЛЬТАТ НЕИЗВЕСТЕН (прогон
- * упал не от проверок — ошибка типов в мутации, зависший процесс). Третий
- * исход не красный и не зелёный, и схлопывать его нельзя ни с тем, ни с
- * другим: «не сошлось» и «не смотрели» — разные вещи.
- */
 function runSuite(files) {
   try {
     execSync(`npx vitest run ${files.join(' ')} --reporter=basic`, { stdio: 'pipe', encoding: 'utf8' });
     return { kind: 'green', failed: 0, names: [] };
   } catch (error) {
     const raw = `${error.stdout ?? ''}${error.stderr ?? ''}`;
-    // Цветовые коды терминала стоят между «Tests» и числом: без очистки
-    // разбор молча не находит ничего и выдаёт «не покрасила».
     const out = raw.replace(/\u001b\[[0-9;]*m/g, '');
     const match = out.match(/Tests\s+(\d+) failed/);
     if (!match) {
@@ -369,20 +324,12 @@ const results = [];
 
 for (const mutation of picked) {
   const original = readFileSync(mutation.file, 'utf8');
-  // Файлы на этой машине с CRLF: якорь из нескольких строк иначе не
-  // находится, и мутация молча «пропускается» — то есть проверка не
-  // выполняется, а выглядит выполненной.
   const LF = String.fromCharCode(10);
   const CRLF = String.fromCharCode(13, 10);
   const eol = original.includes(CRLF) ? CRLF : LF;
   mutation.from = mutation.from.split(LF).join(eol);
   mutation.to = mutation.to.split(LF).join(eol);
   if (!original.includes(mutation.from)) {
-    // Харнесс, не нашедший якорь, ОБЯЗАН ПАДАТЬ. Дважды подряд печаталось
-    // уверенное «0 красных», хотя подстановка не применилась: «ноль
-    // красных» читается как результат («тесты слабые») и ведёт чинить то,
-    // что не сломано. Продолжать прогон после непроставленной мутации
-    // нельзя — остальные строки таблицы будут выглядеть такими же.
     console.error(`ОТКАЗ: якорь мутации не найден в ${mutation.file}: ${mutation.name}`);
     console.error('Результат всего прогона неизвестен, а не зелёный.');
     process.exit(2);
@@ -396,8 +343,6 @@ for (const mutation of picked) {
     results.push({ name: mutation.name, unit, integration, unknown, dead, expect: mutation.expect });
     console.log(`${unknown ? 'НЕИЗВЕСТНО  ' : dead ? 'НЕ ПОКРАСИЛА' : 'ok          '}  ${mutation.name}`);
     console.log(`        модульных: ${show(unit)} · интеграционных: ${show(integration)}`);
-    // Какая именно опора покраснела: красное без этого ничем не отличается
-    // от красного по соседней причине.
     for (const n of [...unit.names, ...integration.names]) console.log(`        красный: ${n}`);
     if (unit.why) console.log(`        модульный упал не от проверок: ${unit.why}`);
     if (integration.why) console.log(`        интеграционный упал не от проверок: ${integration.why}`);
@@ -410,8 +355,6 @@ console.log('\n| мутация | модульных красных | интег
 console.log('| --- | --- | --- |');
 for (const r of results) console.log(`| ${r.name} | ${show(r.unit)} | ${show(r.integration)} |`);
 
-// Невыполненные прогоны — первой строкой резюме и ДО чисел: резюме читают
-// вместо отчёта.
 const unknowns = results.filter((r) => r.unknown);
 if (unknowns.length > 0) {
   console.log(`\nРЕЗУЛЬТАТ НЕИЗВЕСТЕН (${unknowns.length}) — прогон упал не от проверок:`);
@@ -426,6 +369,4 @@ console.log(
   `\nОхват: мутаций ${results.length} · покрасили ${results.length - dead.length - unknowns.length}` +
     ` · не покрасили ${dead.length} · результат неизвестен ${unknowns.length}`,
 );
-// У каждого исхода свой код возврата: «не сошлось» и «результат неизвестен»
-// одним числом — ложь кодом возврата.
 process.exit(dead.length > 0 ? 1 : unknowns.length > 0 ? 2 : 0);

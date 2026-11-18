@@ -9,22 +9,6 @@ import { loadRegistry } from './registry-store.js';
 import { createMdsServer, type MdsServer, type RunningProvider } from './server.js';
 import type { CatalogInstrument, Quote } from './types.js';
 
-/**
- * **Интеграционный набор.** Сервер поднимается целиком, ручки зовутся по
- * HTTP, провайдеры подменены двойниками. Нужен он не для полноты: класс
- * «написано и не вызывается» модульными тестами не ловится **в принципе** —
- * модульный тест зовёт функцию сам. Именно против этого набора прогоняются
- * мутации на проводку (см. `docs/Тесты и смоук.md`).
- *
- * Двойник провайдера намеренно НЕ повторяет сетевой адаптер: он отдаёт
- * ручку, которой тест подаёт тик, и запоминает, какие инструменты ему
- * назначили. Двойник, верный контракту по сигнатурам, но ведущий учёт вместо
- * работы, — самая дорогая разновидность подделки, поэтому здесь проверяется
- * наблюдаемое следствие (что ушло в снапшот), а не вызовы двойника.
- */
-
-// Секрет едет HTTP-заголовком: только ASCII. Это ограничение проверяется
-// отдельным тестом ниже — поймано живым прогоном, а не чтением кода.
 const TOKEN = 'mds-admin-token-dostatochnoy-dliny';
 const STALE_AFTER = 30_000;
 
@@ -46,7 +30,6 @@ const CATALOG: CatalogInstrument[] = [
   instrument('XAUUSD', 'metals-alt', 'metals'),
 ];
 
-/** Реестр с настоящим вторым источником на один символ. */
 function twoSourceRegistry(): Registry {
   const base = builtinRegistry();
   const alt: ProviderEntry = {
@@ -63,8 +46,6 @@ function twoSourceRegistry(): Registry {
     ...base,
     providers: [
       base.providers[0]!,
-      // maxSilenceMs задан намеренно: иначе это поллер, чьё молчание штатно,
-      // и сценарий failover по тишине к нему неприменим (см. отдельный тест).
       { ...base.providers[1]!, enabled: true, requiresKey: false, maxSilenceMs: 60_000 },
       alt,
     ],
@@ -74,14 +55,8 @@ function twoSourceRegistry(): Registry {
 interface Harness {
   server: MdsServer;
   base: string;
-  /** Подать тик от имени источника — как если бы он прилетел из сети. */
   tick(providerId: string, symbol: string, price: number, ts?: number): void;
-  /**
-   * Тик без стакана — так выглядит всё, что приходит от второго
-   * поставщика: цена есть, лучших цен нет (MDS-12).
-   */
   tickWithoutBook(providerId: string, symbol: string, price: number): void;
-  /** Что сейчас назначено источнику. */
   assigned(providerId: string): string[];
   setClock(ms: number): void;
   stopTicking(providerId: string): void;
@@ -102,17 +77,7 @@ async function boot(options: {
   staleAfterMs?: number | null;
   keys?: Map<string, string>;
   catalogSource?: string;
-  /**
-   * Своя вселенная для одного опыта. Нужна там, где проверяется
-   * столкновение канонических имён: общий каталог пришлось бы расширить, и
-   * у соседних проверок поехали бы объявленные числа охвата — красное не о
-   * том, что они проверяют.
-   */
   catalog?: CatalogInstrument[];
-  /**
-   * Умолчание здесь **то же, что в бою** — запрещено. Стенд, по умолчанию
-   * разрешающий то, что в бою запрещено, проверяет не ту систему.
-   */
   allowRoutingIdentityChange?: boolean;
 }): Promise<Harness> {
   let clock = 1_800_000_000_000;
@@ -133,10 +98,6 @@ async function boot(options: {
         : { origin, registry, path },
     staleAfterMs: options.staleAfterMs === undefined ? STALE_AFTER : options.staleAfterMs,
     adminToken: 'adminToken' in options ? options.adminToken : TOKEN,
-    // Поле НЕ передаётся, когда его не просили: иначе боевое умолчание
-    // (`?? false` в server.ts) не исполняется ни разу, и мутация «умолчание
-    // разрешает» не красит ничего — проверено, именно так и вышло.
-    // Стенд, подставляющий значение за боевой код, проверяет не ту систему.
     ...('allowRoutingIdentityChange' in options
       ? { allowRoutingIdentityChange: options.allowRoutingIdentityChange }
       : {}),
@@ -179,8 +140,6 @@ async function boot(options: {
         price,
         digits: entry.digits,
         changePercent: 0,
-        // Лучшие цены несимметричны вокруг цены нарочно: симметричный спред
-        // прошёл бы и при перепутанных местами полях.
         bid: price - 0.3,
         ask: price + 0.7,
         ts: ts ?? clock,
@@ -215,11 +174,6 @@ async function boot(options: {
   return harness;
 }
 
-/**
- * Тело ответа как данные. `Response.json()` типизирован `unknown`, и это
- * правильно: проверяем мы форму ответа, а не свои же типы — утверждать тут
- * тип означало бы проверять собственное представление о контракте.
- */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Body = any;
 
@@ -248,8 +202,6 @@ describe('служебная ручка · кто имеет право её з�
   });
 
   it('секрет не-ASCII → 503 «непередаваем в заголовке», а не вечный 401', async () => {
-    // Иначе настройка выглядит рабочей, клиент не может её даже прислать, а
-    // диагноз «секрет неверный» отправляет чинить не то.
     const h = await boot({ adminToken: 'секрет-достаточной-длины-для-ручки' });
     const res = await fetch(`${h.base}/v1/admin/providers`);
     expect(res.status).toBe(503);
@@ -264,9 +216,6 @@ describe('служебная ручка · кто имеет право её з�
   });
 
   it('нет заголовка → 401 no-token, чужой секрет → 401 bad-token', async () => {
-    // Причина едет САМИМ КОДОМ (Р-339). До 25.10 код был общий
-    // (`unauthorized`), а причина пряталась в `detail` — особый случай
-    // против всех прочих отказов этой ручки, где код конкретен.
     const h = await boot({});
     expect((await asJson(await admin(h, { token: null }))).error).toBe('no-token');
     expect((await asJson(await admin(h, { token: 'ne-tot-sekret-dlinoyu-podlinnee' }))).error).toBe(
@@ -275,9 +224,6 @@ describe('служебная ручка · кто имеет право её з�
   });
 
   it('detail остался пояснением для человека, а не вторым машинным именем', async () => {
-    // Два машинных имени на одно состояние — это и есть то, из-за чего
-    // сверка состава с §4г не сходилась. Теперь `detail` — текст, и ни в
-    // одном словаре он не числится.
     const h = await boot({});
     const body = await asJson(await admin(h, { token: null }));
     expect(body.detail).toContain('x-mds-admin-token');
@@ -290,7 +236,6 @@ describe('служебная ручка · кто имеет право её з�
     expect(options.status).toBe(405);
     const get = await admin(h);
     expect(get.headers.get('access-control-allow-origin')).toBeNull();
-    // На котировках звёздочка остаётся — это другая граница (MDS-04b).
     const health = await fetch(`${h.base}/health`);
     expect(health.headers.get('access-control-allow-origin')).toBe('*');
   });
@@ -348,7 +293,6 @@ describe('служебная ручка · приём изменения', () =>
     const body = await asJson(res);
     expect(body.registry.version).toBe(1);
     expect(body.persisted).toBe(true);
-    // Переживает рестарт: иначе переключатель работает до первого деплоя.
     expect(JSON.parse(readFileSync(path, 'utf8')).version).toBe(1);
     expect(loadRegistry(path).registry?.providers.find((p) => p.id === 'binance')?.enabled).toBe(false);
   });
@@ -367,14 +311,6 @@ describe('служебная ручка · приём изменения', () =>
     expect(entries[1]?.outcome).toBe('rejected:version-conflict');
   });
 
-  /*
-    Запрет на смену личности ведущего (Р-318, §4г).
-
-    Проверяется ОБЕ стороны, и вторая не менее важна первой: сторож,
-    красящий законное, отключают первым, и чинят тогда сторожа, а не текст.
-    Законных правок здесь три — включение, выключение и перестановка
-    приоритета, не меняющая победителя, — и ни одна не должна споткнуться.
-  */
   it('правка меняет личность ведущего → 409 routing-identity-change, реестр не тронут', async () => {
     const h = await boot({});
     const next = twoSourceRegistry();
@@ -383,14 +319,11 @@ describe('служебная ручка · приём изменения', () =>
     expect(res.status).toBe(409);
     const body = await asJson(res);
     expect(body.error).toBe('routing-identity-change');
-    // Правка отклонена целиком: версия не поднялась, источник прежний.
     expect(h.server.registry()?.version).toBe(0);
     expect(h.server.routing()?.routes.get('XAUUSD')?.leader?.providerId).toBe('twelvedata');
   });
 
   it('отказ называет символ и ОБЕ личности, а не только то, что «нельзя»', () => {
-    // Отказ без имён отправляет чинить вслепую: оператор видит «отклонено»
-    // и не знает, какую строку своей правки убирать.
     const next = twoSourceRegistry();
     next.providers = next.providers.map((p) => (p.id === 'metals-alt' ? { ...p, priority: 5 } : p));
     const outcome = applyRegistryUpdate(
@@ -404,15 +337,10 @@ describe('служебная ручка · приём изменения', () =>
     expect(detail).toContain('XAUUSD');
     expect(detail).toContain('twelvedata');
     expect(detail).toContain('metals-alt');
-    // И оговорка про живой каталог: без неё отказ выглядит необъяснимым,
-    // когда биржа сама добавит пару и вчерашняя правка перестанет проходить.
     expect(detail).toContain('ЖИВОМУ каталогу');
   });
 
   it('УМОЛЧАНИЕ — ЗАПРЕЩЕНО: поле не передано вовсе, запрет всё равно работает', async () => {
-    // Проверяется именно боевое умолчание, а не то, что подставил стенд:
-    // переключатель, открытый по умолчанию, — это отсутствующий запрет с
-    // видимостью запрета, и увидеть его отсутствие можно только здесь.
     const h = await boot({});
     expect('allowRoutingIdentityChange' in {}).toBe(false);
     const next = twoSourceRegistry();
@@ -447,7 +375,6 @@ describe('служебная ручка · приём изменения', () =>
   it('МОЛЧИТ НА ЗАКОННОМ: приоритет изменён, но победитель прежний', async () => {
     const h = await boot({});
     const next = twoSourceRegistry();
-    // metals-alt был 30, стал 29 — всё ещё позади twelvedata (20).
     next.providers = next.providers.map((p) => (p.id === 'metals-alt' ? { ...p, priority: 29 } : p));
     expect((await put(h, next)).status).toBe(200);
     expect(h.server.routing()?.routes.get('XAUUSD')?.leader?.providerId).toBe('twelvedata');
@@ -471,8 +398,6 @@ describe('лучшие цены на проводе · сквозь весь с�
   });
 
   it('пустые лучшие цены ПРИСУТСТВУЮТ в теле со значением null, а не исчезают', async () => {
-    // «Поля нет» и «поле пустое» — разные сообщения: первое читается как
-    // «сосед ещё не шлёт», второе как «шлёт, и у него этого нет».
     const h = await boot({});
     h.tickWithoutBook('twelvedata', 'XAUUSD', 2_400);
     const body = await asJson(await fetch(`${h.base}/v1/quotes?symbols=XAUUSD`));
@@ -483,14 +408,6 @@ describe('лучшие цены на проводе · сквозь весь с�
 });
 
 describe('ручка · подмена инструмента под постоянным именем (Р-356)', () => {
-  /*
-    Случай стенда 25.10, воспроизведённый через HTTP.
-
-    Своя вселенная: `EURUSD` стоит ДВАЖДЫ — крипто-парой у binance и
-    форексом у twelvedata. Второй ВЫКЛЮЧЕН, поэтому цены у символа нет
-    вовсе и прежнего ведущего не существует: сосед `routing-identity-change`
-    здесь молчит законно, и промолчал на стенде.
-  */
   const COLLIDING: CatalogInstrument[] = [
     instrument('BTCUSD', 'binance'),
     instrument('EURUSD', 'binance', 'crypto'),
@@ -504,7 +421,6 @@ describe('ручка · подмена инструмента под посто�
 
   it('перестановка precedence отклонена кодом symbol-instrument-change', async () => {
     const h = await boot({ catalog: COLLIDING, registry: onlyBinance() });
-    // До правки имя означает форекс, и цены нет: источник выключен.
     const before = await asJson(await fetch(`${h.base}/v1/quotes?symbols=EURUSD`));
     expect(before.unavailable).toEqual([{ symbol: 'EURUSD', reason: 'source-disabled' }]);
 
@@ -518,8 +434,6 @@ describe('ручка · подмена инструмента под посто�
     expect(body.detail).toContain('forex');
     expect(body.detail).toContain('crypto');
 
-    // Правка отклонена целиком: имя по-прежнему означает прежнее, и
-    // внешний признак не ухудшился с «выключен» на «молчит».
     const after = await asJson(await fetch(`${h.base}/v1/quotes?symbols=EURUSD`));
     expect(after.unavailable).toEqual([{ symbol: 'EURUSD', reason: 'source-disabled' }]);
     expect(h.server.registry()?.version).toBe(0);
@@ -546,9 +460,6 @@ describe('ручка · подмена инструмента под посто�
 
 describe('переключение провайдера · что происходит с ценой под сделками', () => {
   it('источник выключили → его цена исчезает НЕМЕДЛЕННО, а не доживает до порога', async () => {
-    // Это главный тест задачи. Цена свежая (возраст 0 при пороге 30 с):
-    // без инвалидации она отдавалась бы как текущая ещё полпорога после
-    // того, как оператор источник выключил.
     const h = await boot({});
     h.tick('binance', 'BTCUSD', 70_000);
     const before = await asJson(await fetch(`${h.base}/v1/quotes?symbols=BTCUSD`));
@@ -562,17 +473,10 @@ describe('переключение провайдера · что происхо
 
     const after = await asJson(await fetch(`${h.base}/v1/quotes?symbols=BTCUSD`));
     expect(after.items).toEqual([]);
-    // И отказ назван, а не выглядит как «пока не приехало».
     expect(after.unavailable).toEqual([{ symbol: 'BTCUSD', reason: 'source-disabled' }]);
   });
 
   it('смена ведущего источника стирает цену прежнего, а не продолжает ею ряд', async () => {
-    // Переключатель снят НАРОЧНО (Р-318): с 25.10 ровно такая правка
-    // отклоняется кодом `routing-identity-change`, пока витрина не умеет
-    // показывать разрыв ряда. Проверяемое здесь поведение — что происходит
-    // с ценой, КОГДА смена всё-таки разрешена, — от запрета не зависит и
-    // обязано пережить его снятие. Без явного снятия этот тест проверял бы
-    // запрет, а не инвалидацию.
     const h = await boot({ allowRoutingIdentityChange: true });
     h.tick('twelvedata', 'XAUUSD', 2_400);
     expect((await asJson(await fetch(`${h.base}/v1/quotes?symbols=XAUUSD`))).items[0]?.source).toBe(
@@ -588,14 +492,11 @@ describe('переключение провайдера · что происхо
     const after = await asJson(await fetch(`${h.base}/v1/quotes?symbols=XAUUSD`));
     expect(after.items).toEqual([]);
     expect(after.unavailable).toEqual([{ symbol: 'XAUUSD', reason: 'source-silent' }]);
-    // И трансляция переехала на нового ведущего, а не осталась на бумаге.
     expect(h.assigned('metals-alt')).toEqual(['XAUUSD']);
     expect(h.assigned('twelvedata')).toEqual([]);
   });
 
   it('тик от источника, который символ не ведёт, в снапшот не проходит', async () => {
-    // Запасной, оставшийся подписанным, иначе перебивал бы ведущего — цена
-    // менялась бы источником, которого никто не выбирал.
     const h = await boot({});
     h.tick('twelvedata', 'XAUUSD', 2_400);
     h.tick('metals-alt', 'XAUUSD', 2_999);
@@ -606,9 +507,6 @@ describe('переключение провайдера · что происхо
   });
 
   it('поллер молчит часами и это НЕ failover: его молчание объявлено штатным', async () => {
-    // maxSilenceMs: null — не забытое поле, а утверждение «молчание этого
-    // источника отказом не является». Таймер тишины, применённый к поллеру,
-    // устроил бы вечное переключение на ровном месте.
     const reg = twoSourceRegistry();
     reg.providers = reg.providers.map((p) => (p.id === 'twelvedata' ? { ...p, maxSilenceMs: null } : p));
     const h = await boot({ registry: reg });
@@ -640,7 +538,6 @@ describe('переключение провайдера · что происхо
     const body = await asJson(await fetch(`${h.base}/v1/quotes?symbols=XAUUSD`));
     expect(body.items).toEqual([]);
 
-    // Новый источник наполняет символ заново и уже своим провенансом.
     h.tick('metals-alt', 'XAUUSD', 2_412);
     const after = await asJson(await fetch(`${h.base}/v1/quotes?symbols=XAUUSD`));
     expect(after.items[0]).toMatchObject({ price: 2_412, source: 'metals-alt' });
@@ -665,14 +562,6 @@ describe('состояния, которые нельзя путать, видн
   });
 
   it('реестр не прочитан: обе ручки говорят про охват ОДИНАКОВО (QA-05)', async () => {
-    // Вторая половина находки QA-05. `/v1/instruments` отдавал
-    // `coverage: null` правильно с самого начала, а `/health` на том же
-    // состоянии печатал `routed: 0, checked: 0` — «считали, назначенных
-    // ноль». Правильный ответ рядом с неправильным маскировал его.
-    //
-    // Проверка стоит ЗДЕСЬ, а не в модульном наборе: подстановка жила в
-    // проводке (`server.ts`), а не в `buildHealth`. Модульный тест зовёт
-    // функцию сам, и «кто ей что передал» для него неотличимо.
     const h = await boot({ origin: 'error', error: 'JSON: сломан на 3 строке' });
 
     const health = await asJson(await fetch(`${h.base}/health`));
@@ -681,14 +570,10 @@ describe('состояния, которые нельзя путать, видн
     expect(health.registry.routed).toBeNull();
     expect(health.registry.checked).toBeNull();
     expect(instruments.coverage).toBeNull();
-    // Утверждение не про `null` само по себе, а про СОГЛАСИЕ двух ответов:
-    // если кто-то вернёт подстановку в одну из ручек, покраснеет здесь.
     expect(health.registry.routed === null).toBe(instruments.coverage === null);
   });
 
   it('реестр прочитан: обе ручки дают НАСТОЯЩИЕ числа, а не null (QA-05)', async () => {
-    // Разрешающий случай рядом с ограничивающим: без него проверка выше
-    // проходила бы и при «всегда null», то есть при другом дефекте.
     const h = await boot({});
     const health = await asJson(await fetch(`${h.base}/health`));
     const instruments = await asJson(await fetch(`${h.base}/v1/instruments`));
@@ -714,7 +599,6 @@ describe('состояния, которые нельзя путать, видн
   });
 
   it('запасной каталог называет себя запасным в самом ответе, а не в соседнем', async () => {
-    // 33 инструмента запасного каталога уже были однажды приняты за живые 500.
     const h = await boot({ catalogSource: 'static-fallback' });
     const body = await asJson(await fetch(`${h.base}/v1/instruments`));
     expect(body.catalogSource).toBe('static-fallback');
@@ -735,7 +619,6 @@ describe('состояния, которые нельзя путать, видн
     expect(health.status).toBe('degraded');
     expect(health.reason).toContain('без ключа');
     expect(health.registry.missingKeys).toEqual(['twelvedata']);
-    // И символ уезжает к запасному, а не остаётся без источника молча.
     expect(h.assigned('metals-alt')).toEqual(['XAUUSD']);
   });
 
