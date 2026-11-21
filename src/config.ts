@@ -104,6 +104,16 @@ export const config = {
     process.env.MDS_PLATFORM_INSTRUMENTS_PATH ??
     join(dirname(process.env.MDS_REGISTRY_PATH ?? './data/providers.json'), 'platform-instruments.json'),
 
+  marketV2: {
+    apiUrl: (process.env.MARKET_V2_API_URL ?? '').trim(),
+    wsUrl: (process.env.MARKET_V2_WS_URL ?? '').trim(),
+    silenceMs: positiveIntOrNull(process.env.MARKET_V2_SILENCE_MS) ?? 45_000,
+    catalogRefreshMs: positiveIntOrNull(process.env.MARKET_V2_CATALOG_REFRESH_MS) ?? 86_400_000,
+    catalogRetryMs: positiveIntOrNull(process.env.MARKET_V2_CATALOG_RETRY_MS) ?? 300_000,
+    changeRefreshMs: positiveIntOrNull(process.env.MARKET_V2_CHANGE_REFRESH_MS) ?? 3_600_000,
+    healthPollMs: positiveIntOrNull(process.env.MARKET_V2_HEALTH_POLL_MS) ?? 60_000,
+  },
+
   twelveData: {
     apiKey: process.env.TWELVEDATA_API_KEY ?? '',
     apiUrl: process.env.TWELVEDATA_API_URL ?? 'https://api.twelvedata.com',

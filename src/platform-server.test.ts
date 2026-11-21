@@ -72,6 +72,11 @@ async function fakeCms(initial: unknown): Promise<FakeCms> {
   return fake;
 }
 
+function binanceOnlyRegistry() {
+  const base = builtinRegistry();
+  return { ...base, providers: base.providers.filter((p) => p.adapter !== 'modulev2') };
+}
+
 interface Harness {
   server: MdsServer;
   base: string;
@@ -92,7 +97,7 @@ async function boot(options: {
   const server = createMdsServer({
     catalog: CATALOG,
     catalogSource: 'binance-exchange-info',
-    loaded: { origin: 'builtin-default', registry: builtinRegistry(), path: join(tmpdir(), 'none.json') },
+    loaded: { origin: 'builtin-default', registry: binanceOnlyRegistry(), path: join(tmpdir(), 'none.json') },
     staleAfterMs: 60_000,
     adminToken: undefined,
     keys: new Map(),

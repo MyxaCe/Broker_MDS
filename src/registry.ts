@@ -34,7 +34,7 @@ export const CATEGORIES = [
 export type Category = Quote['category'];
 
 /** Адаптеры, для которых в сервисе есть код. Расширяется только правкой кода. */
-export const ADAPTER_KINDS = ['binance', 'twelvedata'] as const;
+export const ADAPTER_KINDS = ['binance', 'twelvedata', 'modulev2'] as const;
 export type AdapterKind = (typeof ADAPTER_KINDS)[number];
 
 const categorySchema = z.enum(CATEGORIES);
@@ -151,6 +151,16 @@ export function builtinRegistry(): Registry {
         // Поллер: молчание между опросами штатно, таймером тишины не судится.
         maxSilenceMs: null,
         requiresKey: true,
+      },
+      {
+        id: 'modulev2',
+        adapter: 'modulev2',
+        label: 'Модуль рыночных данных v2 — форекс, металлы, акции, энергоносители, индексы',
+        enabled: true,
+        priority: 15,
+        covers: ['forex', 'metals', 'stocks', 'energy', 'indices'],
+        maxSilenceMs: 60_000,
+        requiresKey: false,
       },
     ],
     // Настоящий инструмент важнее крипто-пары к USDT с тем же каноническим

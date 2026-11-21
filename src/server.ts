@@ -1,11 +1,18 @@
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
 
-import { buildHealth, buildQuotes, type QuotesRouting, type RegistryHealthInput } from './api.js';
+import {
+  buildHealth,
+  buildQuotes,
+  type ModuleV2Health,
+  type QuotesRouting,
+  type RegistryHealthInput,
+} from './api.js';
 import { groupLabelFor } from './catalog.js';
 import { config } from './config.js';
 import { QuoteHub } from './hub.js';
 import { iconPathFor, iconSvg } from './icons.js';
 import { BinanceProvider } from './providers/binance.js';
+import { ModuleV2Provider, type ModuleV2Catalog, type MarketStatusEvent } from './providers/modulev2.js';
 import { TwelveDataProvider } from './providers/twelvedata.js';
 import {
   ADAPTER_KINDS,
@@ -70,6 +77,7 @@ export interface MdsServerDeps {
   allowRoutingIdentityChange?: boolean;
   /** Не создавать живых адаптеров: для тестов проводки без сети. */
   providerFactory?: ProviderFactory;
+  moduleV2Catalog?: ModuleV2Catalog;
   platform: {
     initial: PlatformInitial;
     sync: PlatformSync | null;
@@ -106,12 +114,14 @@ export interface RunningProvider {
   readonly lastTickAt: number;
   setInstruments(instruments: CatalogInstrument[]): void;
   stop(): void;
+  details?(): Record<string, unknown>;
 }
 
 export type ProviderFactory = (
   entry: ProviderEntry,
   key: string | undefined,
   onQuote: (q: Quote) => void,
+  onStatus: (s: MarketStatusEvent) => void,
 ) => RunningProvider | null;
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -120,6 +130,7 @@ function defaultProviderFactory(
   entry: ProviderEntry,
   key: string | undefined,
   onQuote: (q: Quote) => void,
+  onStatus: (s: MarketStatusEvent) => void,
 ): RunningProvider | null {
   // Проверки «нужен ключ, а ключа нет» здесь НЕТ сознательно: она живёт в
   // `syncProviders`. Две проверки одного свойства на одном пути маскируют
@@ -135,6 +146,28 @@ function defaultProviderFactory(
       },
       setInstruments: (list) => provider.setInstruments(list),
       stop: () => provider.stop(),
+    };
+  }
+
+  if (entry.adapter === 'modulev2') {
+    const provider = new ModuleV2Provider(onQuote, onStatus, {
+      id: entry.id,
+      apiUrl: config.marketV2.apiUrl,
+      wsUrl: config.marketV2.wsUrl,
+      silenceMs: config.marketV2.silenceMs,
+      changeRefreshMs: config.marketV2.changeRefreshMs,
+      healthPollMs: config.marketV2.healthPollMs,
+    });
+    provider.connect();
+    return {
+      id: entry.id,
+      adapter: entry.adapter,
+      get lastTickAt() {
+        return provider.lastTickAt;
+      },
+      setInstruments: (list) => provider.setInstruments(list),
+      stop: () => provider.stop(),
+      details: () => provider.details(),
     };
   }
 
@@ -176,6 +209,7 @@ export interface MdsServer {
   recheck(): ApplyResult | null;
   pollPlatform(): Promise<PlatformPollOutcome>;
   platform(): PlatformState;
+  replaceCatalog(next: CatalogInstrument[]): ApplyResult | null;
   audit: AuditLog;
   close(): void;
 }
@@ -206,26 +240,27 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
   const providerStartedAt = new Map<string, number>();
   const factory = deps.providerFactory ?? defaultProviderFactory;
 
-  const catalogSymbols = new Set(deps.catalog.map((i) => i.symbol));
+  let catalog: CatalogInstrument[] = deps.catalog;
+  let catalogSymbols = new Set(catalog.map((i) => i.symbol));
   const sync = deps.platform.sync;
   let platformList: PlatformList | null = deps.platform.initial.list;
   let platformSource: PlatformSource = deps.platform.initial.source;
   let platformConfirmedAt: number | null = deps.platform.initial.confirmedAt;
   let lastPollAt: number | null = null;
   let lastPollError: string | null = null;
-  let activeCatalog: CatalogInstrument[] = deps.catalog;
+  let activeCatalog: CatalogInstrument[] = catalog;
   let activeSymbols: string[] = [];
   let notInCatalog: string[] = [];
 
   function computeActive(list: PlatformList | null): void {
     if (!list) {
-      activeCatalog = deps.catalog;
+      activeCatalog = catalog;
       activeSymbols = [...catalogSymbols];
       notInCatalog = [];
       return;
     }
     const wanted = new Set(list.instruments.map((i) => i.symbol));
-    activeCatalog = deps.catalog.filter((i) => wanted.has(i.symbol));
+    activeCatalog = catalog.filter((i) => wanted.has(i.symbol));
     activeSymbols = list.instruments.map((i) => i.symbol).filter((s) => catalogSymbols.has(s));
     notInCatalog = list.instruments.map((i) => i.symbol).filter((s) => !catalogSymbols.has(s));
     if (notInCatalog.length > 0) {
@@ -256,6 +291,12 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
       return;
     }
     hub.push(quote);
+  }
+
+  function onStatus(providerId: string, event: MarketStatusEvent): void {
+    const leader = table?.routes.get(event.symbol)?.leader?.providerId;
+    if (leader !== providerId) return;
+    hub.setMarket(event.symbol, event);
   }
 
   /**
@@ -320,7 +361,12 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
       const key = deps.keys.get(id) ?? '';
       let provider = running.get(id);
       if (!provider) {
-        const created = factory(entry, key, (quote) => onQuote(id, quote));
+        const created = factory(
+          entry,
+          key,
+          (quote) => onQuote(id, quote),
+          (event) => onStatus(id, event),
+        );
         if (!created) {
           // Завод отказался создать адаптер — состояние не «молчит», а
           // «не запущен», и наружу оно идёт тем же списком.
@@ -509,6 +555,14 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
   const pollTimer = sync?.cms ? setInterval(() => void pollPlatform(), sync.pollMs) : null;
   pollTimer?.unref?.();
 
+  function replaceCatalog(next: CatalogInstrument[]): ApplyResult | null {
+    catalog = next;
+    catalogSymbols = new Set(catalog.map((i) => i.symbol));
+    computeActive(platformList);
+    console.info(`[mds] каталог обновлён: ${catalog.length} строк`);
+    return registry ? applyRegistry(registry, origin) : null;
+  }
+
   function platformState(): PlatformState {
     return {
       source: platformSource,
@@ -545,6 +599,20 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
       checked: summary === null ? null : summary.checked,
       multiCandidate: summary === null ? null : summary.multiCandidate,
       missingKeys: [...missingKeys],
+    };
+  }
+
+  function moduleV2Health(source: ModuleV2Catalog): ModuleV2Health {
+    const sources: Record<string, Record<string, unknown>> = {};
+    for (const provider of running.values()) {
+      if (provider.adapter === 'modulev2' && provider.details) sources[provider.id] = provider.details();
+    }
+    return {
+      catalog: source.view(),
+      sources,
+      enabledInRegistry: (registry?.providers ?? [])
+        .filter((p) => p.adapter === 'modulev2' && p.enabled)
+        .map((p) => p.id),
     };
   }
 
@@ -666,7 +734,7 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
         body.value,
         { now: new Date(now()), actor },
         {
-          catalog: deps.catalog,
+          catalog,
           allowIdentityChange: deps.allowRoutingIdentityChange ?? false,
         },
       );
@@ -792,7 +860,7 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
         providerOf: leaderOf,
         primaryProvider: registry?.providers.find((p) => p.enabled)?.id ?? '(нет включённых)',
         staleAfterMs: deps.staleAfterMs,
-        catalog: { source: deps.catalogSource, instruments: deps.catalog.length },
+        catalog: { source: deps.catalogSource, instruments: catalog.length },
         registry: registryHealth(),
         platformInstruments: {
           source: platformSource,
@@ -812,6 +880,7 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
             webhook: Boolean(sync?.cms) && (sync?.webhookSecret ?? '') !== '',
           },
         },
+        ...(deps.moduleV2Catalog ? { moduleV2: moduleV2Health(deps.moduleV2Catalog) } : {}),
         clients: hub.clientCount,
         startedAt,
         now: now(),
@@ -829,13 +898,13 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
       let items: Record<string, unknown>[];
       if (all) {
         const full = registry
-          ? resolveRouting(deps.catalog, registry, { silent: silentProviders(), sticky })
+          ? resolveRouting(catalog, registry, { silent: silentProviders(), sticky })
           : null;
         const modeOf = new Map((platformList?.instruments ?? []).map((i) => [i.symbol, i.mode]));
         items = [...(full?.routes.values() ?? [])].map((route) => {
           const i =
             route.leader?.instrument ??
-            deps.catalog.find((c) => c.symbol === route.symbol && c.category === route.category)!;
+            catalog.find((c) => c.symbol === route.symbol && c.category === route.category)!;
           return {
             ...i,
             provider: route.leader?.providerId ?? null,
@@ -896,7 +965,13 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
       json(
         res,
         200,
-        buildQuotes(hub.snapshot(requested ?? undefined), deps.staleAfterMs, quotesRouting(), requested),
+        buildQuotes(
+          hub.snapshot(requested ?? undefined),
+          deps.staleAfterMs,
+          quotesRouting(),
+          requested,
+          hub.markets(requested ?? undefined),
+        ),
       );
       return;
     }
@@ -914,6 +989,7 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
     recheck,
     pollPlatform,
     platform: platformState,
+    replaceCatalog,
     audit,
     close() {
       clearInterval(recheckTimer);

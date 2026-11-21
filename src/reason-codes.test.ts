@@ -33,6 +33,8 @@ const CONTRACT_SYMBOL_AXIS = [
   'stale',
   'not-in-catalog',
   'threshold-unset',
+  'market-closed',
+  'market-halted',
 ];
 
 /**

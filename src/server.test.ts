@@ -304,7 +304,7 @@ describe('служебная ручка · кто имеет право её з�
     const h = await boot({});
     const body = await asJson(await admin(h));
     expect(body.registry.providers).toHaveLength(3);
-    expect(body.adapters).toEqual(['binance', 'twelvedata']);
+    expect(body.adapters).toEqual(['binance', 'twelvedata', 'modulev2']);
     expect(body.origin).toBe('file');
   });
 

@@ -1,7 +1,7 @@
 import type { Server as HttpServer } from 'node:http';
 import { Server } from 'socket.io';
 import { config } from './config.js';
-import type { Quote } from './types.js';
+import type { MarketFlag, Quote } from './types.js';
 
 /**
  * Fan-out хаб. Контракт — драйвер сайта (packages/realtime/drivers/socketio):
@@ -46,6 +46,7 @@ export interface HubOptions {
 
 export class QuoteHub {
   private readonly last = new Map<string, Quote>();
+  private readonly market = new Map<string, MarketFlag & { at: number }>();
   private readonly io: Server;
   private readonly staleAfterMs: number | null;
   private readonly now: () => number;
@@ -97,9 +98,7 @@ export class QuoteHub {
   /** Вход от провайдера: обновить снапшот и пометить dirty у подписчиков. */
   push(quote: Quote) {
     this.last.set(quote.symbol, quote);
-    for (const state of this.clients.values()) {
-      if (state.subscribed.has(quote.symbol)) state.dirty.add(quote.symbol);
-    }
+    this.markDirty(quote.symbol);
   }
 
   /**
@@ -111,8 +110,56 @@ export class QuoteHub {
   private pick(quote: Quote | undefined, at: number): Quote | null {
     if (!quote) return null;
     if (this.staleAfterMs === null) return null;
+    const market = this.marketAt(quote.symbol, at);
+    if (market) return { ...quote, market };
     if (at - quote.ts > this.staleAfterMs) return null;
     return quote;
+  }
+
+  private marketAt(symbol: string, at: number): MarketFlag | null {
+    const state = this.market.get(symbol);
+    if (!state || this.staleAfterMs === null) return null;
+    if (at - state.at > this.staleAfterMs) return null;
+    return { status: state.status, reason: state.reason, nextOpen: state.nextOpen };
+  }
+
+  setMarket(
+    symbol: string,
+    state: { status: 'open' | 'closed' | 'halted'; reason: string | null; nextOpen: number | null },
+  ): void {
+    const previous = this.market.get(symbol);
+    if (state.status === 'open') {
+      if (!previous) return;
+      this.market.delete(symbol);
+      this.markDirty(symbol);
+      return;
+    }
+    const next = { status: state.status, reason: state.reason, nextOpen: state.nextOpen, at: this.now() };
+    this.market.set(symbol, next);
+    if (
+      !previous ||
+      previous.status !== next.status ||
+      previous.reason !== next.reason ||
+      previous.nextOpen !== next.nextOpen
+    ) {
+      this.markDirty(symbol);
+    }
+  }
+
+  markets(symbols?: string[]): Map<string, MarketFlag> {
+    const at = this.now();
+    const out = new Map<string, MarketFlag>();
+    for (const symbol of symbols ?? [...this.market.keys()]) {
+      const flag = this.marketAt(symbol, at);
+      if (flag) out.set(symbol, flag);
+    }
+    return out;
+  }
+
+  private markDirty(symbol: string): void {
+    for (const state of this.clients.values()) {
+      if (state.subscribed.has(symbol)) state.dirty.add(symbol);
+    }
   }
 
   private flush() {
@@ -146,7 +193,8 @@ export class QuoteHub {
     const items: Quote[] = [];
     const staleSymbols: string[] = [];
     for (const quote of candidates) {
-      if (this.pick(quote, at)) items.push(quote);
+      const picked = this.pick(quote, at);
+      if (picked) items.push(picked);
       else staleSymbols.push(quote.symbol);
     }
 
@@ -174,6 +222,7 @@ export class QuoteHub {
     let removed = 0;
     for (const symbol of symbols) {
       if (this.last.delete(symbol)) removed += 1;
+      this.market.delete(symbol);
       for (const state of this.clients.values()) state.dirty.delete(symbol);
     }
     return removed;

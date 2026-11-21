@@ -2,6 +2,8 @@ import type { SnapshotResult } from './hub.js';
 import type { RouteReason } from './registry.js';
 import type { RegistryOrigin } from './registry-store.js';
 import type { PlatformSource } from './platform.js';
+import type { ModuleV2CatalogView } from './providers/modulev2.js';
+import type { MarketFlag } from './types.js';
 
 /**
  * Тела ответов `/health` и `/v1/quotes` — чистыми функциями, отдельно от
@@ -91,6 +93,12 @@ export interface PlatformHealth {
   };
 }
 
+export interface ModuleV2Health {
+  catalog: ModuleV2CatalogView;
+  sources: Record<string, Record<string, unknown>>;
+  enabledInRegistry: string[];
+}
+
 export interface HealthInput {
   /** Возрасты котировок в памяти — источник правды о живости сервиса. */
   ages: { symbol: string; ageMs: number }[];
@@ -106,6 +114,7 @@ export interface HealthInput {
   catalog: { source: string; instruments: number };
   registry: RegistryHealthInput;
   platformInstruments: PlatformHealth;
+  moduleV2?: ModuleV2Health;
   clients: number;
   startedAt: number;
   now?: number;
@@ -142,6 +151,7 @@ export interface HealthBody {
   catalog: { source: string; instruments: number };
   registry: RegistryHealthInput;
   platformInstruments: PlatformHealth;
+  moduleV2?: ModuleV2Health;
   clients: number;
   uptimeSec: number;
   time: string;
@@ -230,6 +240,17 @@ export function buildHealth(input: HealthInput): { httpStatus: 200 | 503; body: 
         `(${input.catalog.instruments}): прежнее поведение и полный тариф поставщика`,
     );
   }
+  const v2 = input.moduleV2;
+  if (v2 && v2.enabledInRegistry.length > 0) {
+    if (!v2.catalog.configured) {
+      warnings.push(
+        `источник ${v2.enabledInRegistry.join(', ')} включён, но MARKET_V2_API_URL не задан — ` +
+          'форекс, металлы, акции и энергоносители модуля v2 не идут',
+      );
+    } else if (v2.catalog.fetchedAt === null) {
+      warnings.push(`каталог модуля v2 не получен (${v2.catalog.lastError ?? 'ещё не запрашивался'}) — инструментов v2 нет`);
+    }
+  }
   const warning = warnings.length > 0 ? warnings.join('; ') : null;
 
   const body: HealthBody = {
@@ -245,6 +266,7 @@ export function buildHealth(input: HealthInput): { httpStatus: 200 | 503; body: 
     catalog: input.catalog,
     registry,
     platformInstruments: input.platformInstruments,
+    ...(input.moduleV2 ? { moduleV2: input.moduleV2 } : {}),
     clients: input.clients,
     uptimeSec: Math.round((now - input.startedAt) / 1000),
     time: new Date(now).toISOString(),
@@ -277,6 +299,8 @@ export const UNAVAILABLE_REASONS = [
   'not-in-catalog',
   /** Реестр не прочитан — маршрутизации нет, работать нечем. */
   'registry-unreadable',
+  'market-closed',
+  'market-halted',
 ] as const;
 
 export type UnavailableReason = (typeof UNAVAILABLE_REASONS)[number];
@@ -296,8 +320,14 @@ export interface QuotesBody extends SnapshotResult {
    * Это главное, что реестр добавил к ответу: отсутствие строки перестало
    * быть единственным сообщением обо всех отказах сразу.
    */
-  unavailable: { symbol: string; reason: UnavailableReason }[];
+  unavailable: UnavailableEntry[];
   reason?: string;
+}
+
+export interface UnavailableEntry {
+  symbol: string;
+  reason: UnavailableReason;
+  nextOpen?: number | null;
 }
 
 function routeToUnavailable(reason: RouteReason | undefined): UnavailableReason {
@@ -332,8 +362,9 @@ export function buildQuotes(
   staleAfterMs: number | null,
   routing: QuotesRouting,
   requested: string[] | null,
+  markets: Map<string, MarketFlag> = new Map(),
 ): QuotesBody {
-  const unavailable: { symbol: string; reason: UnavailableReason }[] = [];
+  const unavailable: UnavailableEntry[] = [];
   const fresh = new Set(snapshot.items.map((q) => q.symbol));
 
   if (!routing.readable) {
@@ -355,6 +386,16 @@ export function buildQuotes(
 
   const universe = requested ?? [...routing.reasons.keys()];
   for (const symbol of universe) {
+    const market = markets.get(symbol);
+    const routed = routing.reasons.has(symbol) && !routing.outsidePlatform?.has(symbol);
+    if (market && routed && staleAfterMs !== null) {
+      unavailable.push({
+        symbol,
+        reason: market.status === 'halted' ? 'market-halted' : 'market-closed',
+        nextOpen: market.nextOpen,
+      });
+      continue;
+    }
     if (fresh.has(symbol)) continue;
     if (staleAfterMs === null) {
       unavailable.push({ symbol, reason: 'threshold-unset' });

@@ -5,6 +5,7 @@ import { config } from './config.js';
 import { resolveStartupPlatform, type CmsEndpoint } from './platform.js';
 import { loadRegistry } from './registry-store.js';
 import { createMdsServer } from './server.js';
+import { ModuleV2Catalog } from './providers/modulev2.js';
 import type { ProviderEntry } from './registry.js';
 
 /**
@@ -51,9 +52,23 @@ if (!cryptoUniverse) {
 // фактически, решает реестр: записи Twelve Data остаются в каталоге, даже
 // если источник выключен, иначе выключение выглядело бы как исчезновение
 // инструментов из вселенной.
-const catalog = [...cryptoUniverse, ...CATALOG.filter((i) => i.provider === 'twelvedata')];
-
 const loaded = loadRegistry(config.registryPath);
+
+const moduleV2Id =
+  loaded.registry?.providers.find((p) => p.adapter === 'modulev2')?.id ?? 'modulev2';
+const moduleV2Catalog = new ModuleV2Catalog({ apiUrl: config.marketV2.apiUrl, sourceId: moduleV2Id });
+if (moduleV2Catalog.configured) {
+  const first = await moduleV2Catalog.refresh();
+  if (first.ok) {
+    console.info(`[mds] модуль v2: каталог ${moduleV2Catalog.instruments.length} инструментов`);
+  }
+} else {
+  console.warn('[mds] MARKET_V2_API_URL не задан — источник modulev2 без каталога, инструментов v2 нет');
+}
+
+const twelveRows = CATALOG.filter((i) => i.provider === 'twelvedata');
+const buildCatalog = () => [...cryptoUniverse, ...moduleV2Catalog.instruments, ...twelveRows];
+const catalog = buildCatalog();
 if (loaded.origin === 'builtin-default') {
   console.warn(
     `[mds] реестра провайдеров нет (${loaded.path}) — работаем по ВСТРОЕННОМУ УМОЛЧАНИЮ. ` +
@@ -114,6 +129,7 @@ const server = createMdsServer({
   adminToken: config.adminToken,
   allowRoutingIdentityChange: config.allowRoutingIdentityChange,
   keys,
+  moduleV2Catalog,
   platform: {
     initial: { list: startup.list, source: startup.source, confirmedAt: startup.confirmedAt },
     sync: {
@@ -124,6 +140,18 @@ const server = createMdsServer({
     },
   },
 });
+
+if (moduleV2Catalog.configured) {
+  const schedule = (delay: number) => {
+    const timer = setTimeout(async () => {
+      const result = await moduleV2Catalog.refresh();
+      if (result.changed) server.replaceCatalog(buildCatalog());
+      schedule(result.ok ? config.marketV2.catalogRefreshMs : config.marketV2.catalogRetryMs);
+    }, delay);
+    timer.unref?.();
+  };
+  schedule(moduleV2Catalog.fetchedAt === null ? config.marketV2.catalogRetryMs : config.marketV2.catalogRefreshMs);
+}
 
 if (config.staleAfterMs === null) {
   console.error(

@@ -1,9 +1,8 @@
 /**
  * Контракт котировки. Сверен с `Quote` из `packages/realtime` сайта
- * (FeedDriver) — но **«один в один» уже неправда, и в обе стороны** (MDS-11):
- * `changePercent` у сайта обнуляем, у нас пока нет (`MDS-09`, ждёт очереди),
- * а `source` шлём мы, и в модели сайта его нет — он числится у них в списке
- * сознательно не читаемых и ждёт решения штаба.
+ * (FeedDriver) — но **«один в один» уже неправда** (MDS-11): `source` и
+ * `market` шлём мы, а в модели сайта их нет. `changePercent` обнуляем с обеих
+ * сторон.
  */
 export interface Quote {
   symbol: string;
@@ -11,7 +10,7 @@ export interface Quote {
   category: 'forex' | 'metals' | 'crypto' | 'indices' | 'stocks' | 'energy';
   price: number;
   digits: number;
-  changePercent: number;
+  changePercent: number | null;
   /**
    * Лучшая цена покупки и лучшая цена продажи (MDS-12).
    *
@@ -52,6 +51,19 @@ export interface Quote {
    * очередной тик (ADR-031).
    */
   source: string;
+  market?: MarketFlag;
+}
+
+export interface MarketFlag {
+  status: 'closed' | 'halted';
+  reason: string | null;
+  nextOpen: number | null;
+}
+
+export interface InstrumentSession {
+  timezone: string;
+  weekly: { open: string; close: string }[];
+  holidays: string[];
 }
 
 /**
@@ -78,4 +90,10 @@ export interface CatalogInstrument {
    */
   provider: string;
   providerSymbol: string;
+  tickSize?: string;
+  qtyDecimals?: number;
+  qtyStep?: string;
+  minQty?: string;
+  contractSize?: string;
+  session?: InstrumentSession;
 }
