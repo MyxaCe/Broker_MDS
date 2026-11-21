@@ -639,8 +639,10 @@ export class ModuleV2Provider {
             `${this.api}/v2/candles?symbol=${encodeURIComponent(symbol)}&interval=1d&limit=2`,
             this.fetchImpl,
           );
-          this.prevClose.set(symbol, { value: prevCloseFromCandles(body), at: this.now() });
-          this.reemit(symbol);
+          const before = this.prevClose.get(symbol)?.value ?? null;
+          const value = prevCloseFromCandles(body);
+          this.prevClose.set(symbol, { value, at: this.now() });
+          if (value !== before) this.reemit(symbol);
         } catch (error) {
           console.warn(`[${this.id}] дневные свечи ${symbol} не получены: ${errorText(error, this.secrets)}`);
         }
