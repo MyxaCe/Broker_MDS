@@ -79,6 +79,12 @@ jobs:
           # переменная. Подменив один BINANCE_WS_URL, «половина без чужой
           # сети» всё равно ходила бы в api.binance.com за каталогом.
           node scripts/fake-binance.mjs > /tmp/fake.log 2>&1 & echo $! > /tmp/fake.pid
+          node scripts/fake-module-v2.mjs > /tmp/fake-v2.log 2>&1 & echo $! > /tmp/fake-v2.pid
+          for i in $(seq 1 30); do
+            curl -fs -o /dev/null http://127.0.0.1:18766/fake-v2-key/v2/health && \
+              curl -fs -o /dev/null http://127.0.0.1:18765/api/v3/exchangeInfo && break
+            sleep 1
+          done
 
           # ПРАВКА 3: секрет ручки ГЕНЕРИРУЕТСЯ здесь и ASCII.
           # (а) Секрет репозитория для этого не нужен вовсе: обе стороны —
@@ -94,6 +100,7 @@ jobs:
           QUOTE_STALE_AFTER_MS=60000 \
           BINANCE_WS_URL=ws://127.0.0.1:18765 \
           BINANCE_API_URL=http://127.0.0.1:18765 \
+          MARKET_V2_API_URL=http://127.0.0.1:18766/fake-v2-key \
           MDS_REGISTRY_PATH=/tmp/mds-ci-registry.json \
           MDS_ADMIN_TOKEN="$TOKEN" \
           PORT=3003 \
@@ -138,7 +145,7 @@ jobs:
       - name: Логи поднятого
         if: always()
         run: |
-          for f in /tmp/mds.log /tmp/fake.log; do
+          for f in /tmp/mds.log /tmp/fake.log /tmp/fake-v2.log; do
             echo "===== $f ====="
             tail -c 4000 "$f" 2>/dev/null || echo "(файла нет)"
           done
@@ -148,7 +155,7 @@ jobs:
       - name: Снять поднятое
         if: always()
         run: |
-          for p in /tmp/mds.pid /tmp/fake.pid; do
+          for p in /tmp/mds.pid /tmp/fake.pid /tmp/fake-v2.pid; do
             [ -f "$p" ] && kill "$(cat "$p")" 2>/dev/null || true
           done
           wait 2>/dev/null || true

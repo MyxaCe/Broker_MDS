@@ -313,6 +313,73 @@ check(
   `причина недоступности названа: ${JSON.stringify(unknown.unavailable?.[0])}`,
 );
 
+const FAKE_V2_OPEN = { symbol: 'EURUSD', price: 1.10005, bid: 1.1, ask: 1.1001, changePercent: 0.92 };
+const FAKE_V2_CLOSED = { symbol: 'XAUUSD', price: 2650.3 };
+
+const v2Configured = health?.moduleV2?.catalog?.configured === true;
+if (!v2Configured) {
+  for (const label of [
+    'модуль v2: каталог и поток в /health',
+    'модуль v2: EURUSD — форекс модуля в каталоге MDS',
+    'модуль v2: цена = (bid+ask)/2, изменение от вчерашнего закрытия',
+    'модуль v2: закрытый рынок — последняя цена с флагом и причина market-closed',
+  ]) {
+    unexecuted('fake', label, 'MARKET_V2_API_URL не задан у проверяемого MDS');
+  }
+} else {
+  let v2Quotes = null;
+  for (let i = 0; i < 20; i++) {
+    v2Quotes = await (await fetch(`${MDS}/v1/quotes?symbols=${FAKE_V2_OPEN.symbol},${FAKE_V2_CLOSED.symbol}`)).json();
+    const open = v2Quotes.items?.find((q) => q.symbol === FAKE_V2_OPEN.symbol);
+    if (open?.changePercent !== null && open !== undefined && v2Quotes.items?.some((q) => q.symbol === FAKE_V2_CLOSED.symbol)) break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  const v2Health = (await (await fetch(`${MDS}/health`)).json()).moduleV2;
+  const v2Source = v2Health?.sources?.modulev2;
+  check(
+    'fake',
+    v2Health?.catalog?.instruments >= 2 &&
+      typeof v2Health?.catalog?.ageMs === 'number' &&
+      v2Source?.connected === true &&
+      v2Source?.markets?.closed >= 1 &&
+      typeof v2Source?.upstream?.maxStreams === 'number',
+    `модуль v2: каталог и поток в /health (каталог ${v2Health?.catalog?.instruments}, ` +
+      `поток ${v2Source?.connected ? 'подключён' : 'нет'}, закрытых рынков ${v2Source?.markets?.closed}, ` +
+      `streamed ${v2Source?.upstream?.streamed}/${v2Source?.upstream?.maxStreams})`,
+  );
+  const eurRow = instAll.items?.find((i) => i.symbol === FAKE_V2_OPEN.symbol);
+  check(
+    'fake',
+    eurRow?.category === 'forex' && eurRow?.provider === 'modulev2' && eurRow?.group === 'Валюта — Мажоры',
+    `модуль v2: EURUSD — форекс модуля в каталоге MDS (${eurRow?.category}, ${eurRow?.provider}, «${eurRow?.group}»)`,
+  );
+  const openQ = v2Quotes?.items?.find((q) => q.symbol === FAKE_V2_OPEN.symbol);
+  check(
+    'fake',
+    openQ?.price === FAKE_V2_OPEN.price &&
+      openQ?.bid === FAKE_V2_OPEN.bid &&
+      openQ?.ask === FAKE_V2_OPEN.ask &&
+      openQ?.changePercent === FAKE_V2_OPEN.changePercent &&
+      openQ?.source === 'modulev2' &&
+      openQ?.market === undefined,
+    `модуль v2: цена = (bid+ask)/2, изменение от вчерашнего закрытия: ${openQ?.price} ` +
+      `(${openQ?.bid}/${openQ?.ask}, ${openQ?.changePercent}%), источник=${openQ?.source}`,
+  );
+  const closedQ = v2Quotes?.items?.find((q) => q.symbol === FAKE_V2_CLOSED.symbol);
+  const closedWhy = v2Quotes?.unavailable?.find((u) => u.symbol === FAKE_V2_CLOSED.symbol);
+  check(
+    'fake',
+    closedQ?.price === FAKE_V2_CLOSED.price &&
+      closedQ?.market?.status === 'closed' &&
+      Date.now() - closedQ.ts > (v2Quotes?.staleAfterMs ?? Infinity) &&
+      closedWhy?.reason === 'market-closed' &&
+      typeof closedWhy?.nextOpen === 'number',
+    `модуль v2: закрытый рынок — последняя цена с флагом и причина market-closed: ` +
+      `${FAKE_V2_CLOSED.symbol}=${closedQ?.price} market=${JSON.stringify(closedQ?.market)} ` +
+      `unavailable=${JSON.stringify(closedWhy)}`,
+  );
+}
+
 // Служебная ручка: без секрета не пускает. Проверка границы, а не удобства.
 const noToken = await fetch(`${MDS}/v1/admin/providers`);
 check(
