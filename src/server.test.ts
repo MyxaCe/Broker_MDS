@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { ADMIN_CODES, applyRegistryUpdate } from './admin.js';
 import { builtinRegistry, type ProviderEntry, type Registry } from './registry.js';
 import { loadRegistry } from './registry-store.js';
-import { createMdsServer, type MdsServer, type RunningProvider } from './server.js';
+import { createMdsServer, type MdsServer, type MdsServerDeps, type RunningProvider } from './server.js';
 import type { CatalogInstrument, Quote } from './types.js';
 
 /**
@@ -114,6 +114,7 @@ async function boot(options: {
    * разрешающий то, что в бою запрещено, проверяет не ту систему.
    */
   allowRoutingIdentityChange?: boolean;
+  platform?: MdsServerDeps['platform'];
 }): Promise<Harness> {
   let clock = 1_800_000_000_000;
   const emitters = new Map<string, (q: Quote) => void>();
@@ -143,6 +144,10 @@ async function boot(options: {
     keys: options.keys ?? new Map(),
     now: () => clock,
     routingRecheckMs: 1_000_000, // пересчёт зовём руками, чтобы не ловить гонку
+    platform: options.platform ?? {
+      initial: { list: null, source: 'catalog-fallback', confirmedAt: null },
+      sync: null,
+    },
     providerFactory: (entry, _key, onQuote): RunningProvider | null => {
       emitters.set(entry.id, onQuote);
       lastTick.set(entry.id, clock);

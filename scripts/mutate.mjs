@@ -18,11 +18,13 @@ const UNIT = [
   'src/catalog.test.ts',
   'src/hub.test.ts',
   'src/reason-codes.test.ts',
+  'src/platform.test.ts',
 ];
 const INTEGRATION = [
   'src/server.test.ts',
   'src/providers/binance.test.ts',
   'src/providers/twelvedata.test.ts',
+  'src/platform-server.test.ts',
 ];
 
 /**
@@ -70,6 +72,27 @@ function assertSetsCoverDisk() {
 
 /** @type {{name: string, file: string, from: string, to: string, expect: string}[]} */
 const MUTATIONS = [
+  {
+    name: 'инструменты платформы: маршрутизация по всему каталогу, список не применяется',
+    file: 'src/server.ts',
+    from: 'const resolved = resolveRouting(activeCatalog, next, { silent: silentProviders(next), sticky });',
+    to: 'const resolved = resolveRouting(deps.catalog, next, { silent: silentProviders(next), sticky });',
+    expect: 'интеграционный: MDS подписан на весь каталог при заданном списке',
+  },
+  {
+    name: 'инструменты платформы: применение без сравнения version',
+    file: 'src/server.ts',
+    from: '    if (current && fetched.list.version <= current.version) {',
+    to: '    if (false) {',
+    expect: 'интеграционный: старая версия из CMS перетирает новую',
+  },
+  {
+    name: 'инструменты платформы: вебхук без проверки подписи',
+    file: 'src/server.ts',
+    from: "      if (!verifySignature(raw, Array.isArray(header) ? header[0] : header, secret)) {",
+    to: '      if (false) {',
+    expect: 'интеграционный: кто угодно дёргает опрос CMS',
+  },
   {
     name: 'проводка: переключение не забывает цену прежнего источника',
     file: 'src/server.ts',

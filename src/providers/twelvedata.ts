@@ -148,6 +148,7 @@ export class TwelveDataProvider {
   }
   private chunkIndex = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private polling = false;
   status: ProviderStatus = 'connecting';
   lastTickAt = 0;
   /**
@@ -180,11 +181,15 @@ export class TwelveDataProvider {
 
   connect() {
     if (!this.cfg.apiKey || this.instruments.length === 0) return;
+    if (this.timer !== null || this.polling) return;
     void this.poll();
   }
 
   private schedule(delayMs: number) {
-    this.timer = setTimeout(() => void this.poll(), delayMs);
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      void this.poll();
+    }, delayMs);
     this.timer.unref?.();
   }
 
@@ -210,6 +215,15 @@ export class TwelveDataProvider {
   }
 
   private async poll() {
+    this.polling = true;
+    try {
+      await this.pollChunk();
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  private async pollChunk() {
     const chunks = this.activeChunks();
     if (chunks.length === 0) return;
     const chunk = chunks[this.chunkIndex % chunks.length]!;

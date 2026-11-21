@@ -214,6 +214,43 @@ check(
     `каталог=${inst.catalogSource}${inst.isFallbackCatalog ? ' (ЗАПАСНОЙ — число не равно живой вселенной)' : ''}`,
 );
 
+const plat = health?.platformInstruments;
+check(
+  'contract',
+  ['cms', 'file', 'catalog-fallback'].includes(plat?.source) &&
+    typeof plat?.applied === 'number' &&
+    Array.isArray(plat?.notInCatalog) &&
+    typeof plat?.cms?.configured === 'boolean' &&
+    (plat.source === 'catalog-fallback'
+      ? plat.ageMs === null && typeof health?.warning === 'string'
+      : typeof plat.ageMs === 'number' && typeof plat.version === 'number'),
+  `инструменты платформы: источник=${plat?.source} v${plat?.version}, в каталоге из списка ${plat?.applied}, ` +
+    `возраст ${plat?.ageMs} мс` +
+    (plat?.source === 'catalog-fallback' ? ' — ВЕСЬ КАТАЛОГ, предупреждение в /health' : ''),
+);
+
+const instAll = await (await fetch(`${MDS}/v1/instruments?all=1`)).json();
+check(
+  'contract',
+  instAll.scope === 'catalog' &&
+    inst.scope === 'platform' &&
+    Array.isArray(instAll.items) &&
+    instAll.items.length >= (inst.items?.length ?? Infinity) &&
+    (inst.items ?? []).every((i) => instAll.items.some((a) => a.symbol === i.symbol)),
+  `instruments?all=1: весь каталог ${instAll.items?.length} ⊇ платформа ${inst.items?.length}`,
+);
+
+const hookRes = await fetch(`${MDS}/v1/hooks/platform-instruments`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'X-Signature': 'sha256=00' },
+  body: '{}',
+});
+check(
+  'contract',
+  (hookRes.status === 401 || hookRes.status === 503) && hookRes.headers.get('access-control-allow-origin') === null,
+  `вебхук инструментов платформы с чужой подписью: HTTP ${hookRes.status} (401 подпись / 503 выключен), без CORS`,
+);
+
 const snap = await (await fetch(`${MDS}/v1/quotes?symbols=BTCUSD,ETHUSD`)).json();
 const btc = snap.items?.find((q) => q.symbol === 'BTCUSD');
 checkLive(

@@ -1,5 +1,7 @@
 /** Конфигурация MDS. Всё через env, дефолты — локальный dev. */
 
+import { dirname, join } from 'node:path';
+
 /**
  * Целое положительное число из env — или `null`, если переменной нет либо
  * значение непригодно. Отдельная функция, потому что `Number(undefined)`
@@ -90,6 +92,17 @@ export const config = {
    */
   allowRoutingIdentityChange:
     (process.env.MDS_ALLOW_ROUTING_IDENTITY_CHANGE ?? '').trim() === 'true',
+
+  cms: {
+    apiUrl: (process.env.CMS_API_URL ?? '').trim(),
+    apiKey: (process.env.CMS_API_KEY ?? '').trim(),
+    pollMs: positiveIntOrNull(process.env.CMS_POLL_MS) ?? 30_000,
+    webhookSecret: (process.env.CMS_WEBHOOK_SECRET ?? '').trim(),
+  },
+
+  platformInstrumentsPath:
+    process.env.MDS_PLATFORM_INSTRUMENTS_PATH ??
+    join(dirname(process.env.MDS_REGISTRY_PATH ?? './data/providers.json'), 'platform-instruments.json'),
 
   twelveData: {
     apiKey: process.env.TWELVEDATA_API_KEY ?? '',

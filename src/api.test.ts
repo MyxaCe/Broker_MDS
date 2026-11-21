@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildHealth, buildQuotes, type HealthInput, type QuotesRouting } from './api.js';
+import { buildHealth, buildQuotes, type HealthInput, type PlatformHealth, type QuotesRouting } from './api.js';
 import type { SnapshotResult } from './hub.js';
 import type { RouteReason } from './registry.js';
 
@@ -10,6 +10,22 @@ import type { RouteReason } from './registry.js';
  */
 
 const NOW = 1_800_000_000_000;
+
+function platformHealth(over: Partial<PlatformHealth> = {}): PlatformHealth {
+  return {
+    source: 'cms',
+    version: 4,
+    updatedAt: '2026-11-21T10:00:00Z',
+    confirmedAt: new Date(NOW - 5_000).toISOString(),
+    ageMs: 5_000,
+    selected: 30,
+    applied: 30,
+    closeOnly: 0,
+    notInCatalog: [],
+    cms: { configured: true, pollMs: 30_000, lastPollAt: null, lastError: null, webhook: true },
+    ...over,
+  };
+}
 
 function health(over: Partial<HealthInput> = {}) {
   return buildHealth({
@@ -32,6 +48,7 @@ function health(over: Partial<HealthInput> = {}) {
       multiCandidate: 0,
       missingKeys: [],
     },
+    platformInstruments: platformHealth(),
     clients: 0,
     startedAt: NOW - 60_000,
     now: NOW,
@@ -460,5 +477,69 @@ describe('/health · состояние реестра провайдеров', 
       },
     });
     expect(body.registry.origin).toBe('builtin-default');
+  });
+});
+
+describe('/health · инструменты платформы', () => {
+  it('список из CMS: источник, версия и возраст в ответе, тревоги нет', () => {
+    const { httpStatus, body } = health();
+    expect(httpStatus).toBe(200);
+    expect(body.platformInstruments.source).toBe('cms');
+    expect(body.platformInstruments.version).toBe(4);
+    expect(body.platformInstruments.ageMs).toBe(5_000);
+    expect(body.warning).toBeUndefined();
+  });
+
+  it('весь каталог по запасному пути → warning, но не degraded', () => {
+    const { httpStatus, body } = health({
+      platformInstruments: platformHealth({
+        source: 'catalog-fallback',
+        version: null,
+        updatedAt: null,
+        confirmedAt: null,
+        ageMs: null,
+        selected: null,
+        applied: 484,
+      }),
+    });
+    expect(httpStatus).toBe(200);
+    expect(body.status).toBe('ok');
+    expect(body.warning).toContain('весь каталог');
+    expect(body.warning).toContain('484');
+  });
+
+  it('тревоги складываются, а не затирают друг друга', () => {
+    const { body } = health({
+      registry: {
+        origin: 'file',
+        version: 3,
+        providers: [{ id: 'binance', enabled: true, silent: false }],
+        routed: 484,
+        checked: 484,
+        multiCandidate: 2,
+        missingKeys: [],
+      },
+      platformInstruments: platformHealth({ source: 'catalog-fallback' }),
+    });
+    expect(body.warning).toContain('Р-317');
+    expect(body.warning).toContain('весь каталог');
+  });
+
+  it('символ каталога вне списка платформы → no-source, а не not-in-catalog', () => {
+    const routing: QuotesRouting = {
+      readable: true,
+      reasons: new Map<string, RouteReason>([['BTCUSD', 'primary']]),
+      outsidePlatform: new Set(['ETHUSD']),
+    };
+    const body = buildQuotes(
+      { items: [], staleSymbols: [], checked: 0, missing: [] },
+      10_000,
+      routing,
+      ['ETHUSD', 'NOPEUSD'],
+    );
+    expect(body.unavailable).toEqual([
+      { symbol: 'ETHUSD', reason: 'no-source' },
+      { symbol: 'NOPEUSD', reason: 'not-in-catalog' },
+    ]);
   });
 });

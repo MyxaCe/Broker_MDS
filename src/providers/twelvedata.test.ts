@@ -224,3 +224,16 @@ describe('normalizeTwelveQuote · успешный разбор ≠ пригод
     expect(quote?.ts).toBe(1784990000000);
   });
 });
+
+describe('повторный connect не плодит цепочек опроса', () => {
+  it('смена набора зовёт connect снова — запрос всё равно один', async () => {
+    const calls = withResponses({});
+    const { p } = provider();
+    p.connect();
+    p.setInstruments([EURUSD]);
+    p.connect();
+    p.connect();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toHaveLength(1);
+  });
+});

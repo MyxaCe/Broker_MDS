@@ -2,6 +2,7 @@ import 'dotenv/config';
 
 import { CATALOG, fetchBinanceSpotUniverse } from './catalog.js';
 import { config } from './config.js';
+import { resolveStartupPlatform, type CmsEndpoint } from './platform.js';
 import { loadRegistry } from './registry-store.js';
 import { createMdsServer } from './server.js';
 import type { ProviderEntry } from './registry.js';
@@ -92,6 +93,19 @@ function keyFor(entry: ProviderEntry): string {
 
 const keys = new Map((loaded.registry?.providers ?? []).map((p) => [p.id, keyFor(p)]));
 
+const cms: CmsEndpoint | null =
+  config.cms.apiUrl !== '' && config.cms.apiKey !== ''
+    ? { apiUrl: config.cms.apiUrl, apiKey: config.cms.apiKey }
+    : null;
+const startup = await resolveStartupPlatform({ cms, filePath: config.platformInstrumentsPath });
+for (const line of startup.log) {
+  if (line.level === 'warn') console.warn(line.message);
+  else console.info(line.message);
+}
+if (cms && config.cms.webhookSecret === '') {
+  console.warn('[mds] CMS_WEBHOOK_SECRET не задан — вебхук инструментов платформы выключен, остаётся опрос');
+}
+
 const server = createMdsServer({
   catalog,
   catalogSource,
@@ -100,6 +114,15 @@ const server = createMdsServer({
   adminToken: config.adminToken,
   allowRoutingIdentityChange: config.allowRoutingIdentityChange,
   keys,
+  platform: {
+    initial: { list: startup.list, source: startup.source, confirmedAt: startup.confirmedAt },
+    sync: {
+      cms,
+      filePath: config.platformInstrumentsPath,
+      pollMs: config.cms.pollMs,
+      webhookSecret: config.cms.webhookSecret,
+    },
+  },
 });
 
 if (config.staleAfterMs === null) {
@@ -124,6 +147,7 @@ server.httpServer.listen(config.port, () => {
   const routed = table ? [...table.routes.values()].filter((r) => r.leader).length : 0;
   console.info(
     `[mds] listening on :${config.port} — каталог ${catalog.length} (${catalogSource}), ` +
-      `маршрутизировано ${routed}, реестр ${loaded.origin} v${loaded.registry?.version ?? '—'}`,
+      `маршрутизировано ${routed}, реестр ${loaded.origin} v${loaded.registry?.version ?? '—'}, ` +
+      `инструменты платформы ${startup.source}${startup.list ? ` v${startup.list.version}` : ''}`,
   );
 });

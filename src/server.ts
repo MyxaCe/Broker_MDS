@@ -26,6 +26,15 @@ import {
   describeChanges,
   type AdminCode,
 } from './admin.js';
+import {
+  fetchPlatformList,
+  savePlatformFile,
+  verifySignature,
+  type CmsEndpoint,
+  type PlatformInitial,
+  type PlatformList,
+  type PlatformSource,
+} from './platform.js';
 import type { CatalogInstrument, Quote } from './types.js';
 
 /**
@@ -61,6 +70,34 @@ export interface MdsServerDeps {
   allowRoutingIdentityChange?: boolean;
   /** Не создавать живых адаптеров: для тестов проводки без сети. */
   providerFactory?: ProviderFactory;
+  platform: {
+    initial: PlatformInitial;
+    sync: PlatformSync | null;
+  };
+}
+
+export interface PlatformSync {
+  cms: CmsEndpoint | null;
+  filePath: string;
+  pollMs: number;
+  webhookSecret: string;
+}
+
+export type PlatformPollOutcome =
+  | { outcome: 'disabled' }
+  | { outcome: 'error'; error: string }
+  | { outcome: 'unchanged'; version: number }
+  | { outcome: 'older'; version: number; current: number }
+  | { outcome: 'applied'; version: number; persisted: boolean; effect: ApplyResult | null };
+
+export interface PlatformState {
+  source: PlatformSource;
+  list: PlatformList | null;
+  confirmedAt: number | null;
+  active: string[];
+  notInCatalog: string[];
+  lastPollAt: number | null;
+  lastError: string | null;
 }
 
 export interface RunningProvider {
@@ -137,6 +174,8 @@ export interface MdsServer {
   shadowedTicks(): number;
   /** Пересчёт маршрутизации по тишине источников. Возвращает применённый результат. */
   recheck(): ApplyResult | null;
+  pollPlatform(): Promise<PlatformPollOutcome>;
+  platform(): PlatformState;
   audit: AuditLog;
   close(): void;
 }
@@ -166,6 +205,38 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
   /** Когда источник был запущен: до первого тика тишину считаем от запуска. */
   const providerStartedAt = new Map<string, number>();
   const factory = deps.providerFactory ?? defaultProviderFactory;
+
+  const catalogSymbols = new Set(deps.catalog.map((i) => i.symbol));
+  const sync = deps.platform.sync;
+  let platformList: PlatformList | null = deps.platform.initial.list;
+  let platformSource: PlatformSource = deps.platform.initial.source;
+  let platformConfirmedAt: number | null = deps.platform.initial.confirmedAt;
+  let lastPollAt: number | null = null;
+  let lastPollError: string | null = null;
+  let activeCatalog: CatalogInstrument[] = deps.catalog;
+  let activeSymbols: string[] = [];
+  let notInCatalog: string[] = [];
+
+  function computeActive(list: PlatformList | null): void {
+    if (!list) {
+      activeCatalog = deps.catalog;
+      activeSymbols = [...catalogSymbols];
+      notInCatalog = [];
+      return;
+    }
+    const wanted = new Set(list.instruments.map((i) => i.symbol));
+    activeCatalog = deps.catalog.filter((i) => wanted.has(i.symbol));
+    activeSymbols = list.instruments.map((i) => i.symbol).filter((s) => catalogSymbols.has(s));
+    notInCatalog = list.instruments.map((i) => i.symbol).filter((s) => !catalogSymbols.has(s));
+    if (notInCatalog.length > 0) {
+      console.warn(
+        `[mds] инструменты платформы v${list.version}: ${notInCatalog.length} символов нет в каталоге — пропущены: ` +
+          notInCatalog.slice(0, 20).join(', ') +
+          (notInCatalog.length > 20 ? ' …' : ''),
+      );
+    }
+  }
+  computeActive(platformList);
 
   const httpServer = createServer((req, res) => handle(req, res));
   const hub = new QuoteHub(httpServer, { staleAfterMs: deps.staleAfterMs, now });
@@ -271,7 +342,7 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
     origin = nextOrigin;
     loadError = undefined;
     missingKeys = providersWithoutKey(next);
-    const resolved = resolveRouting(deps.catalog, next, { silent: silentProviders(next), sticky });
+    const resolved = resolveRouting(activeCatalog, next, { silent: silentProviders(next), sticky });
     const { invalidate, changed } = diffRouting(table, resolved);
     table = resolved;
     announceMultiCandidate(resolved);
@@ -329,7 +400,7 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
   function recheck(): ApplyResult | null {
     if (!registry) return null;
     missingKeys = providersWithoutKey(registry);
-    const resolved = resolveRouting(deps.catalog, registry, { silent: silentProviders(), sticky });
+    const resolved = resolveRouting(activeCatalog, registry, { silent: silentProviders(), sticky });
     const { invalidate, changed } = diffRouting(table, resolved);
     if (changed.length === 0) return null;
     table = resolved;
@@ -354,6 +425,101 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
 
   const recheckTimer = setInterval(() => recheck(), deps.routingRecheckMs ?? config.routingRecheckMs);
   recheckTimer.unref?.();
+
+  function applyPlatform(list: PlatformList, source: PlatformSource, at: number): ApplyResult | null {
+    const before = new Set(activeSymbols);
+    platformList = list;
+    platformSource = source;
+    platformConfirmedAt = at;
+    computeActive(list);
+    const after = new Set(activeSymbols);
+    const added = [...after].filter((s) => !before.has(s)).length;
+    const removed = [...before].filter((s) => !after.has(s)).length;
+    console.info(
+      `[mds] инструменты платформы v${list.version} (${source}): ${activeSymbols.length} в подписке, ` +
+        `+${added} / −${removed}, вне каталога ${notInCatalog.length}`,
+    );
+    return registry ? applyRegistry(registry, origin) : null;
+  }
+
+  let pollInFlight: Promise<PlatformPollOutcome> | null = null;
+  let pollAgain = false;
+  let lastOlderVersion: number | null = null;
+
+  async function pollOnce(cms: CmsEndpoint, filePath: string): Promise<PlatformPollOutcome> {
+    lastPollAt = now();
+    const fetched = await fetchPlatformList(cms);
+    if (!fetched.ok) {
+      if (lastPollError !== fetched.error) {
+        console.warn(
+          `[mds] опрос инструментов платформы в CMS не удался: ${fetched.error} — ` +
+            `работаем по текущему списку (${platformSource}${platformList ? ` v${platformList.version}` : ''})`,
+        );
+      }
+      lastPollError = fetched.error;
+      return { outcome: 'error', error: fetched.error };
+    }
+    if (lastPollError !== null) console.info('[mds] CMS снова отдаёт инструменты платформы');
+    lastPollError = null;
+    const at = now();
+    const current = platformList;
+    if (current && fetched.list.version <= current.version) {
+      platformConfirmedAt = at;
+      if (fetched.list.version === current.version) {
+        platformSource = 'cms';
+        return { outcome: 'unchanged', version: current.version };
+      }
+      if (lastOlderVersion !== fetched.list.version) {
+        lastOlderVersion = fetched.list.version;
+        console.warn(
+          `[mds] CMS отдала инструменты платформы v${fetched.list.version} старше текущей v${current.version} — не применяется`,
+        );
+      }
+      return { outcome: 'older', version: fetched.list.version, current: current.version };
+    }
+    lastOlderVersion = null;
+    let persisted = true;
+    try {
+      savePlatformFile(filePath, fetched.list, at);
+    } catch (error) {
+      persisted = false;
+      console.warn(`[mds] инструменты платформы не записаны в ${filePath}: ${(error as Error).message}`);
+    }
+    const effect = applyPlatform(fetched.list, 'cms', at);
+    return { outcome: 'applied', version: fetched.list.version, persisted, effect };
+  }
+
+  function pollPlatform(): Promise<PlatformPollOutcome> {
+    if (!sync?.cms) return Promise.resolve({ outcome: 'disabled' });
+    if (pollInFlight) {
+      pollAgain = true;
+      return pollInFlight;
+    }
+    const cms = sync.cms;
+    pollInFlight = pollOnce(cms, sync.filePath).finally(() => {
+      pollInFlight = null;
+      if (pollAgain) {
+        pollAgain = false;
+        void pollPlatform();
+      }
+    });
+    return pollInFlight;
+  }
+
+  const pollTimer = sync?.cms ? setInterval(() => void pollPlatform(), sync.pollMs) : null;
+  pollTimer?.unref?.();
+
+  function platformState(): PlatformState {
+    return {
+      source: platformSource,
+      list: platformList,
+      confirmedAt: platformConfirmedAt,
+      active: [...activeSymbols],
+      notInCatalog: [...notInCatalog],
+      lastPollAt,
+      lastError: lastPollError,
+    };
+  }
 
   /* ---------------------------------------------------------------- */
   /* HTTP                                                              */
@@ -386,7 +552,9 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
     const reasons = new Map<string, RouteReason>();
     if (!table) return { readable: false, reasons };
     for (const [symbol, route] of table.routes) reasons.set(symbol, route.reason);
-    return { readable: true, reasons };
+    const routes = table.routes;
+    const outsidePlatform = new Set([...catalogSymbols].filter((s) => !routes.has(s)));
+    return { readable: true, reasons, outsidePlatform };
   }
 
   function json(res: ServerResponse, status: number, body: unknown, noStore = false): void {
@@ -557,11 +725,57 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
     });
   }
 
+  function handlePlatformWebhook(req: IncomingMessage, res: ServerResponse): void {
+    if (req.method !== 'POST') {
+      json(res, 405, { error: 'method-not-allowed' }, true);
+      return;
+    }
+    const secret = sync?.webhookSecret ?? '';
+    if (!sync?.cms || secret === '') {
+      json(
+        res,
+        503,
+        { error: 'webhook-disabled', detail: 'не заданы CMS_API_URL/CMS_API_KEY или CMS_WEBHOOK_SECRET' },
+        true,
+      );
+      return;
+    }
+    void readRaw(req).then((raw) => {
+      if (raw === null) {
+        json(res, 413, { error: 'bad-body', detail: `тело больше ${MAX_BODY_BYTES} байт` }, true);
+        return;
+      }
+      const header = req.headers['x-signature'];
+      if (!verifySignature(raw, Array.isArray(header) ? header[0] : header, secret)) {
+        json(res, 401, { error: 'bad-signature' }, true);
+        return;
+      }
+      void pollPlatform();
+      json(res, 202, { accepted: true }, true);
+    });
+  }
+
+  async function readRaw(req: IncomingMessage): Promise<Buffer | null> {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length;
+      if (size > MAX_BODY_BYTES) return null;
+      chunks.push(chunk as Buffer);
+    }
+    return Buffer.concat(chunks);
+  }
+
   function handle(req: IncomingMessage, res: ServerResponse): void {
     const url = new URL(req.url ?? '/', 'http://mds');
 
     if (url.pathname.startsWith('/v1/admin/')) {
       handleAdmin(req, res, url);
+      return;
+    }
+
+    if (url.pathname === '/v1/hooks/platform-instruments') {
+      handlePlatformWebhook(req, res);
       return;
     }
 
@@ -580,6 +794,24 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
         staleAfterMs: deps.staleAfterMs,
         catalog: { source: deps.catalogSource, instruments: deps.catalog.length },
         registry: registryHealth(),
+        platformInstruments: {
+          source: platformSource,
+          version: platformList?.version ?? null,
+          updatedAt: platformList?.updatedAt ?? null,
+          confirmedAt: platformConfirmedAt === null ? null : new Date(platformConfirmedAt).toISOString(),
+          ageMs: platformConfirmedAt === null ? null : now() - platformConfirmedAt,
+          selected: platformList ? platformList.instruments.length : null,
+          applied: activeSymbols.length,
+          closeOnly: platformList?.instruments.filter((i) => i.mode === 'closeOnly').length ?? 0,
+          notInCatalog: [...notInCatalog],
+          cms: {
+            configured: Boolean(sync?.cms),
+            pollMs: sync?.cms ? sync.pollMs : null,
+            lastPollAt: lastPollAt === null ? null : new Date(lastPollAt).toISOString(),
+            lastError: lastPollError,
+            webhook: Boolean(sync?.cms) && (sync?.webhookSecret ?? '') !== '',
+          },
+        },
         clients: hub.clientCount,
         startedAt,
         now: now(),
@@ -593,23 +825,49 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
       // инструмента запасного каталога за живые 500. Поле `catalogSource`
       // стоит в самом ответе, а не только в `/health`, потому что читают
       // этот ответ, а не соседний.
-      const items = [...(table?.routes.values() ?? [])]
-        .filter((route) => route.leader !== null)
-        .map((route) => {
-          const i = route.leader!.instrument;
+      const all = url.searchParams.get('all') === '1';
+      let items: Record<string, unknown>[];
+      if (all) {
+        const full = registry
+          ? resolveRouting(deps.catalog, registry, { silent: silentProviders(), sticky })
+          : null;
+        const modeOf = new Map((platformList?.instruments ?? []).map((i) => [i.symbol, i.mode]));
+        items = [...(full?.routes.values() ?? [])].map((route) => {
+          const i =
+            route.leader?.instrument ??
+            deps.catalog.find((c) => c.symbol === route.symbol && c.category === route.category)!;
           return {
             ...i,
-            provider: route.leader!.providerId,
+            provider: route.leader?.providerId ?? null,
             icon: iconPathFor(i.symbol),
             group: groupLabelFor(i),
+            platform: platformList ? (modeOf.get(i.symbol) ?? null) : 'trade',
           };
         });
+      } else {
+        const order = new Map(activeSymbols.map((symbol, index) => [symbol, index]));
+        const rank = (symbol: string) => order.get(symbol) ?? Number.MAX_SAFE_INTEGER;
+        items = [...(table?.routes.values() ?? [])]
+          .filter((route) => route.leader !== null)
+          .sort((a, b) => (platformList ? rank(a.symbol) - rank(b.symbol) : 0))
+          .map((route) => {
+            const i = route.leader!.instrument;
+            return {
+              ...i,
+              provider: route.leader!.providerId,
+              icon: iconPathFor(i.symbol),
+              group: groupLabelFor(i),
+            };
+          });
+      }
       const summary = table ? summarizeRouting(table) : null;
       json(res, table ? 200 : 503, {
         items,
         catalogSource: deps.catalogSource,
         isFallbackCatalog: deps.catalogSource === 'static-fallback',
         registry: { origin, version: registry?.version ?? null },
+        scope: all ? 'catalog' : 'platform',
+        platformInstruments: { source: platformSource, version: platformList?.version ?? null },
         coverage: summary,
         ...(table
           ? {}
@@ -654,9 +912,12 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
     registry: () => registry,
     shadowedTicks: () => shadowed,
     recheck,
+    pollPlatform,
+    platform: platformState,
     audit,
     close() {
       clearInterval(recheckTimer);
+      if (pollTimer) clearInterval(pollTimer);
       for (const provider of running.values()) provider.stop();
       running.clear();
       httpServer.close();

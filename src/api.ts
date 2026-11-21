@@ -1,6 +1,7 @@
 import type { SnapshotResult } from './hub.js';
 import type { RouteReason } from './registry.js';
 import type { RegistryOrigin } from './registry-store.js';
+import type { PlatformSource } from './platform.js';
 
 /**
  * Тела ответов `/health` и `/v1/quotes` — чистыми функциями, отдельно от
@@ -71,6 +72,25 @@ export interface RegistryHealthInput {
   missingKeys: string[];
 }
 
+export interface PlatformHealth {
+  source: PlatformSource;
+  version: number | null;
+  updatedAt: string | null;
+  confirmedAt: string | null;
+  ageMs: number | null;
+  selected: number | null;
+  applied: number;
+  closeOnly: number;
+  notInCatalog: string[];
+  cms: {
+    configured: boolean;
+    pollMs: number | null;
+    lastPollAt: string | null;
+    lastError: string | null;
+    webhook: boolean;
+  };
+}
+
 export interface HealthInput {
   /** Возрасты котировок в памяти — источник правды о живости сервиса. */
   ages: { symbol: string; ageMs: number }[];
@@ -85,6 +105,7 @@ export interface HealthInput {
   staleAfterMs: number | null;
   catalog: { source: string; instruments: number };
   registry: RegistryHealthInput;
+  platformInstruments: PlatformHealth;
   clients: number;
   startedAt: number;
   now?: number;
@@ -120,6 +141,7 @@ export interface HealthBody {
   providers: ProviderHealth[];
   catalog: { source: string; instruments: number };
   registry: RegistryHealthInput;
+  platformInstruments: PlatformHealth;
   clients: number;
   uptimeSec: number;
   time: string;
@@ -194,12 +216,21 @@ export function buildHealth(input: HealthInput): { httpStatus: 200 | 503; body: 
 
   // Тревога считается ОТДЕЛЬНО от `reason` и статуса — см. `warning`.
   // `null` не тревожит: «не считали» — это не «насчитали много».
-  const warning =
-    registry.multiCandidate !== null && registry.multiCandidate > 0
-      ? `у ${registry.multiCandidate} символов больше одного кандидата в источники: ` +
+  const warnings: string[] = [];
+  if (registry.multiCandidate !== null && registry.multiCandidate > 0) {
+    warnings.push(
+      `у ${registry.multiCandidate} символов больше одного кандидата в источники: ` +
         'смена источника на живом символе возможна, а потребитель показывает её ' +
-        'очередным тиком — скачком цены как движением рынка (Р-317)'
-      : null;
+        'очередным тиком — скачком цены как движением рынка (Р-317)',
+    );
+  }
+  if (input.platformInstruments.source === 'catalog-fallback') {
+    warnings.push(
+      'инструментов платформы нет ни из CMS, ни из файла — подписка на весь каталог ' +
+        `(${input.catalog.instruments}): прежнее поведение и полный тариф поставщика`,
+    );
+  }
+  const warning = warnings.length > 0 ? warnings.join('; ') : null;
 
   const body: HealthBody = {
     status: reason === null ? 'ok' : 'degraded',
@@ -213,6 +244,7 @@ export function buildHealth(input: HealthInput): { httpStatus: 200 | 503; body: 
     providers,
     catalog: input.catalog,
     registry,
+    platformInstruments: input.platformInstruments,
     clients: input.clients,
     uptimeSec: Math.round((now - input.startedAt) / 1000),
     time: new Date(now).toISOString(),
@@ -253,6 +285,7 @@ export type UnavailableReason = (typeof UNAVAILABLE_REASONS)[number];
 export interface QuotesRouting {
   readable: boolean;
   reasons: Map<string, RouteReason>;
+  outsidePlatform?: Set<string>;
 }
 
 export interface QuotesBody extends SnapshotResult {
@@ -333,7 +366,9 @@ export function buildQuotes(
       symbol,
       reason: snapshot.staleSymbols?.includes(symbol)
         ? 'stale'
-        : routeToUnavailable(routing.reasons.get(symbol)),
+        : routing.outsidePlatform?.has(symbol)
+          ? 'no-source'
+          : routeToUnavailable(routing.reasons.get(symbol)),
     });
   }
 
