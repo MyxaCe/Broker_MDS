@@ -1,21 +1,6 @@
 import type { CatalogInstrument, Quote } from '../types.js';
 import type { ProviderStatus } from './binance.js';
 
-/**
- * Провайдер Twelve Data (форекс, металлы, акции, индексы): REST-поллер
- * /quote батчами. Архитектура «как для PRO», бюджет — конфиг:
- *  - 1 символ в батче = 1 кредит; чанк ≤ creditsPerMin (не упираемся
- *    в минутный лимит одним запросом);
- *  - интервал между запросами растянут под creditsPerDay (с резервом 10%) —
- *    free-ключ 800/день на ~17 символах даёт обновление каждые ~30 мин,
- *    PRO-ключ → env повыше и поллер ускоряется сам;
- *  - символ, отвергнутый тарифом (404/план), уходит в чёрный список до
- *    рестарта — кредиты на него больше не тратятся;
- *  - top-level 429 → пауза минута без смены чанка.
- * WebSocket Twelve Data — апгрейд внутри этого же класса, потребители
- * (hub) разницы не заметят.
- */
-
 interface TwelveQuote {
   symbol?: string;
   close?: string;
@@ -27,7 +12,6 @@ interface TwelveQuote {
 }
 
 export interface TwelveDataConfig {
-  /** id источника из реестра провайдеров: уходит в `Quote.source` (Р-047). */
   id: string;
   apiKey: string;
   apiUrl: string;
@@ -35,45 +19,6 @@ export interface TwelveDataConfig {
   creditsPerDay: number;
 }
 
-/**
- * Разбор котировки Twelve Data. `null` вместо котировки, если непригодна
- * хоть одна из трёх величин: цена, изменение, момент.
- *
- * **Поправка 20.10 (QA-05).** Здесь стояли два умолчания, и оба были
- * записаны как осознанные — с объяснением рядом, как и положено. Одно
- * обоснование устарело, второе оказалось неполным.
- *
- * 1. ~~`changePercent` → 0: «умолчание в проценте изменения — косметика».~~
- *    **Отменено.** Приём, выведенный терминалом: границы просматривают
- *    начиная с полей, которые отображаются **цветом, стрелкой или знаком**.
- *    `changePercent` — ровно такое поле: ноль со знаком рисуется как
- *    «+0.00%», то есть как **утверждение о рынке**, а знали мы только
- *    «процент не разобрали». Прочерк читается как «неизвестно» мгновенно,
- *    зелёный ноль — нет.
- *
- *    И вторая половина той же находки: **два ответа одного сервиса про одну
- *    величину обязаны говорить одинаково.** Соседний адаптер (`binance.ts`,
- *    `normalizeTick`) с самого начала отвергает тик целиком при
- *    неразобранном `changePercent`. Правильный ответ лежал рядом с
- *    неправильным — и маскировал его.
- *
- * 2. ~~Нет `timestamp` — берём своё время, иначе `ts: 0` означало бы
- *    «котировки нет».~~ **Отменено.** Про `0` рассуждение верное, но из
- *    него не следует, что верен `Date.now()`: исходов три, а рассмотрено
- *    было два. `Date.now()` утверждает «цена получена сейчас», а известно
- *    только «момента нам не прислали».
- *
- *    Цена этого умолчания не косметическая. `ts` течёт прямо в фильтр
- *    свежести (`hub.pick`: `at - quote.ts > staleAfterMs`), поэтому
- *    котировка с выдуманным моментом **не протухает никогда**. Источник,
- *    отвечающий телом без времени, выдавал бы вчерашнюю цену как текущую
- *    бесконечно — против этого и написан §5г, ради этого MDS вообще держит
- *    порог свежести.
- *
- * Отказ здесь **fail-closed и не молчаливый**: вызывающий считает
- * отброшенные записи и называет их числом (`dropped`), иначе «источник
- * ничего не прислал» было бы неотличимо от «всё отбросили».
- */
 export function normalizeTwelveQuote(
   entry: TwelveQuote,
   instrument: CatalogInstrument,
@@ -83,8 +28,6 @@ export function normalizeTwelveQuote(
   const changePercent = Number.parseFloat(entry.percent_change ?? '');
   if (!Number.isFinite(price)) return null;
   if (!Number.isFinite(changePercent)) return null;
-  // Ноль здесь тоже непригоден: эпоха 1970 — не момент котировки, а признак
-  // того, что поля не было. Разбор и пригодность — разные барьеры.
   const seconds = entry.timestamp;
   if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) return null;
   return {
@@ -94,20 +37,7 @@ export function normalizeTwelveQuote(
     price,
     digits: instrument.digits,
     changePercent,
-    /*
-      Лучших цен этот источник не даёт, и это **заявление, а не
-      умолчание** (MDS-12). Живой ответ `/quote` от 25.10 несёт symbol,
-      name, exchange, datetime, timestamp, last_quote_at, open, high, low,
-      close, previous_close, change, percent_change, is_market_open и
-      fifty_two_week — ни `bid`, ни `ask`.
 
-      Оговорка, которую надо держать на виду: ответ снят ДЕМОНСТРАЦИОННЫМ
-      ключом, своего у нас нет, и часть их ручек он отдаёт как 403. Живым
-      кадром с платного тарифа это не проверено. За вывод — их собственная
-      спецификация: во всём документе `bid`/`ask` встречаются ровно в одной
-      схеме, цепочке опционов. Появится платный ключ — проверять первым
-      делом здесь.
-    */
     bid: null,
     ask: null,
     ts: seconds * 1000,
@@ -115,21 +45,10 @@ export function normalizeTwelveQuote(
   };
 }
 
-/**
- * Размер батча: 1 символ = 1 кредит, и в один запрос не кладём больше, чем
- * минутный лимит, иначе упрёмся в него одним обращением.
- */
 export function chunkSizeFor(cfg: Pick<TwelveDataConfig, 'creditsPerMin'>): number {
   return Math.max(1, Math.min(cfg.creditsPerMin, 8));
 }
 
-/**
- * Пауза между запросами: минутный лимит И дневной бюджет (резерв 10%).
- * Вынесено из класса чистой функцией — по этому числу считается, могут ли
- * котировки Twelve Data вообще быть свежими (тест-растяжка в
- * `twelvedata.test.ts`: на free-тарифе интервал 16 минут, и любой разумный
- * порог свежести делает их протухшими по построению).
- */
 export function pollIntervalMs(cfg: Pick<TwelveDataConfig, 'creditsPerMin' | 'creditsPerDay'>): number {
   const dailyBudget = Math.max(1, Math.floor(cfg.creditsPerDay * 0.9));
   const byDay = Math.ceil((86_400_000 * chunkSizeFor(cfg)) / dailyBudget);
@@ -140,7 +59,6 @@ export class TwelveDataProvider {
   private instruments: CatalogInstrument[] = [];
   private readonly blacklist = new Set<string>();
 
-  /** Канонические символы, отвергнутые тарифом (для фильтра вселенной). */
   get rejectedSymbols(): string[] {
     return this.instruments
       .filter((i) => this.blacklist.has(i.providerSymbol))
@@ -151,11 +69,6 @@ export class TwelveDataProvider {
   private polling = false;
   status: ProviderStatus = 'connecting';
   lastTickAt = 0;
-  /**
-   * Сколько записей отброшено как непригодные за жизнь процесса. Нужен,
-   * чтобы «источник молчит» было отличимо от «источник отвечает, и всё
-   * отвечаемое мы выбрасываем»: снаружи оба выглядят одинаково — цены нет.
-   */
   droppedTotal = 0;
 
   constructor(
@@ -193,13 +106,11 @@ export class TwelveDataProvider {
     this.timer.unref?.();
   }
 
-  /** Остановка поллера (тесты, штатное завершение). */
   stop() {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
   }
 
-  /** Один цикл опроса вручную — для тестов, чтобы не ждать расписания. */
   async pollOnce(): Promise<void> {
     await this.poll();
     this.stop();
@@ -234,7 +145,6 @@ export class TwelveDataProvider {
       const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
       const data = (await res.json()) as TwelveQuote | Record<string, TwelveQuote>;
 
-      // Top-level ошибка (429 исчерпан лимит / 401 ключ): чанк не двигаем
       if (typeof (data as TwelveQuote).code === 'number' && !(data as TwelveQuote).close) {
         const top = data as TwelveQuote;
         console.warn(`[twelvedata] API ${top.code}: ${top.message ?? ''}`);
@@ -252,7 +162,6 @@ export class TwelveDataProvider {
             : (data as Record<string, TwelveQuote>)[instrument.providerSymbol];
         if (!entry) continue;
         if (typeof entry.code === 'number') {
-          // Символ не входит в тариф/не найден — не жжём кредиты дальше
           this.blacklist.add(instrument.providerSymbol);
           console.warn(
             `[twelvedata] ${instrument.providerSymbol} отклонён (${entry.code}: ${entry.message ?? ''}) — в чёрный список`,
@@ -265,11 +174,6 @@ export class TwelveDataProvider {
           this.lastTickAt = Date.now();
           this.onQuote(quote);
         } else {
-          // Отброшенное считаем и называем. Мягкий разбор означает «не
-          // падает», а не «исчезает без следа»: без счётчика «источник
-          // ничего не прислал» неотличимо от «всё пришедшее отбросили», а
-          // чинятся они по-разному. Отброс стал возможен чаще с QA-05 —
-          // тем нужнее след.
           dropped.push(instrument.providerSymbol);
           this.droppedTotal += 1;
         }
@@ -283,8 +187,6 @@ export class TwelveDataProvider {
       }
       if (gotAny) this.status = 'connected';
       this.chunkIndex += 1;
-      // Первый прогон: пройти все чанки подряд (минутный лимит уважаем),
-      // чтобы снапшот наполнился, дальше — крейсерский интервал
       const warmup = this.chunkIndex < chunks.length;
       this.schedule(warmup ? 61_000 : this.intervalMs);
     } catch (error) {

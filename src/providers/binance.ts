@@ -2,63 +2,19 @@ import WebSocket from 'ws';
 import { config } from '../config.js';
 import type { CatalogInstrument, Quote } from '../types.js';
 
-/**
- * Провайдер Binance: raw-сокет /ws + SUBSCRIBE на `<symbol>@ticker` по
- * всем парам вселенной (24h-статистика: lastPrice + priceChangePercent).
- * Публичные данные, ключ не нужен. Лимит Binance — 1024 стрима на
- * соединение; подписку шлём чанками по 500 (и ≤5 сообщений/сек).
- * Всеобщий `!ticker@arr` не используем — в нашей сети он не отдаёт кадров.
- * Reconnect с backoff; разрыв каждые 24ч у Binance штатный.
- *
- * **Реконнект стоит на двух ногах, и вторая обязательна (B-003).** События
- * `close`/`error` ловят разрыв, о котором нам сообщили. При half-open TCP
- * никто ничего не сообщает: сокет открыт, данных нет, `close` не придёт
- * никогда. Отсутствие события не является событием — поэтому есть ещё и
- * таймер тишины: нет опознанного тика `silenceMs` — соединение считается
- * мёртвым независимо от того, что о себе думает сокет.
- */
-
-// Лимит Binance на размер одного WS-сообщения (~8 КБ → «Payload too long»):
-// держим чанк маленьким. Плюс лимит 5 сообщений/сек — шлём с задержкой.
 const MAX_STREAMS_PER_MSG = 100;
 const SUBSCRIBE_STAGGER_MS = 300;
 
 interface BinanceTicker {
-  e: string; // "24hrTicker"
-  E: number; // event time ms
-  s: string; // "BTCUSDT"
-  c: string; // last price
-  P: string; // price change percent
-  /**
-   * Лучшая цена покупки и лучшая цена продажи (MDS-12).
-   *
-   * **Объявлены по живому кадру, а не по документации.** Кадр снят 25.10 с
-   * `wss://stream.binance.com:9443/ws` тем же путём, каким ходит этот класс:
-   * в нём 23 ключа, читали мы 5, и `b`/`a` всё это время приходили и молча
-   * отбрасывались приведением к этому типу. Объявление разборщика не было
-   * свидетельством ни за, ни против — нужен был живой кадр, и он снят.
-   *
-   * Что `b`/`a` — именно лучшие цены, а не узнано по букве: сверено с
-   * `<symbol>@bookTicker` (по определению best bid/offer) на одном сокете,
-   * совпадение до нуля по обеим величинам.
-   *
-   * Поля необязательные, потому что обязательность здесь была бы
-   * утверждением о проводе: мы наблюдали их в 471 кадре из 471, но «всегда»
-   * из этого не следует.
-   */
-  b?: string; // best bid price
-  a?: string; // best ask price
+  e: string;
+  E: number;
+  s: string;
+  c: string;
+  P: string;
+  b?: string;
+  a?: string;
 }
 
-/**
- * Лучшая цена с одной стороны стакана. `null` — поля нет или значение
- * непригодно.
- *
- * Ноль и отрицательное отвергаются **как значение, а не как форма**:
- * нулевая цена покупки означала бы сделку по нулю, отрицательная — то же с
- * другой стороны. Отсутствие поля и непригодное значение дают одно `null`
- * намеренно: наружу оба означают «лучшей цены у нас нет».
- */
 function bestPrice(raw: string | undefined): number | null {
   if (raw === undefined) return null;
   const value = Number.parseFloat(raw);
@@ -69,11 +25,8 @@ function bestPrice(raw: string | undefined): number | null {
 export type ProviderStatus = 'connecting' | 'connected' | 'reconnecting';
 
 export interface BinanceProviderOptions {
-  /** Адрес WS. Вынесен в опции, чтобы тест мог поднять поддельного провайдера. */
   wsUrl: string;
-  /** Таймер тишины, мс: столько без опознанного тика — соединение мёртвое. */
   silenceMs: number;
-  /** id источника из реестра провайдеров: уходит в `Quote.source` (Р-047). */
   id: string;
 }
 
@@ -88,18 +41,6 @@ export function normalizeTick(
   const changePercent = Number.parseFloat(data.P);
   if (!Number.isFinite(price) || !Number.isFinite(changePercent)) return null;
 
-  /*
-    Лучшие цены разбираются ПОСЛЕ барьера отказа и своего барьера не
-    образуют: негодный стакан тик не отбрасывает. Цена известна, лучшие
-    цены — нет, и это выразимо (MDS-12).
-
-    Перекрещённый стакан (`bid > ask`) снимает ОБЕ стороны, а не ту, что
-    выглядит хуже: при перекрестье известно, что одна из величин неверна, и
-    неизвестно какая. Оставить «лучшую» значило бы выбрать наугад и выдать
-    выбор за знание. На живом рынке не наблюдалось ни разу (0 из 471
-    кадра), поэтому ветка дешёвая — но без неё свойство было бы «сошлось с
-    оговоркой», а это не «сошлось».
-  */
   let bid = bestPrice(data.b);
   let ask = bestPrice(data.a);
   if (bid !== null && ask !== null && bid > ask) {
@@ -131,17 +72,10 @@ export class BinanceProvider {
   private readonly wsUrl: string;
   private readonly silenceMs: number;
   readonly id: string;
-  /** Что уже подписано на текущем сокете: база для дельты при переназначении. */
   private subscribed = new Set<string>();
-  /**
-   * Момент последнего **признака жизни соединения**: открытие сокета либо
-   * опознанный тик. Отдельно от `lastTickAt`, потому что до первого тика
-   * `lastTickAt = 0`, и таймер тишины срывался бы в реконнект сразу же.
-   */
   private lastSignalAt = 0;
   status: ProviderStatus = 'connecting';
   lastTickAt = 0;
-  /** Сколько раз соединение было признано мёртвым по тишине. Для /health и тестов. */
   silenceReconnects = 0;
 
   constructor(
@@ -153,14 +87,6 @@ export class BinanceProvider {
     this.id = options?.id ?? 'binance';
   }
 
-  /**
-   * Пары, которые источник обязан транслировать. Зовётся и при старте, и при
-   * каждой смене маршрутизации (Р-047): переключение провайдера обязано
-   * доходить до живого сокета, а не только до таблицы в памяти.
-   *
-   * На открытом сокете шлём **дельту**, а не переподключаемся: переподключение
-   * ради смены набора уронило бы и те символы, которых правка не касалась.
-   */
   setInstruments(instruments: CatalogInstrument[]) {
     this.instruments = instruments;
     this.bySymbol = new Map(instruments.map((i) => [i.providerSymbol, i]));
@@ -168,7 +94,6 @@ export class BinanceProvider {
     if (ws && ws.readyState === WebSocket.OPEN) this.applyDelta(ws);
   }
 
-  /** Разница между подписанным и нужным, чанками и с уважением к лимитам. */
   private applyDelta(ws: WebSocket) {
     const wanted = new Set(this.instruments.map((i) => i.providerSymbol));
     const toAdd = [...wanted].filter((s) => !this.subscribed.has(s));
@@ -194,11 +119,6 @@ export class BinanceProvider {
     }
   }
 
-  /**
-   * Подписка на @ticker всех пар вселенной: чанки по 100 (иначе Binance
-   * рвёт «Payload too long») с задержкой (лимит 5 сообщений/сек).
-   * Лимит 1024 стрима на соединение — при большем нужен шардинг по сокетам.
-   */
   private subscribe(ws: WebSocket) {
     if (this.instruments.length > 1024) {
       console.warn(
@@ -217,12 +137,6 @@ export class BinanceProvider {
     }
   }
 
-  /**
-   * Таймер тишины. Тикает чаще порога, иначе фактическое обнаружение
-   * растягивается вдвое. `terminate()`, а не `close()`: закрытие с
-   * рукопожатием ждёт ответа той стороны, а её как раз и нет — на half-open
-   * `close()` может висеть до системного таймаута TCP.
-   */
   private startWatchdog(ws: WebSocket) {
     this.stopWatchdog();
     const tick = Math.max(200, Math.floor(this.silenceMs / 3));
@@ -250,7 +164,6 @@ export class BinanceProvider {
     ws.on('open', () => {
       this.attempts = 0;
       this.status = 'connected';
-      // Отсчёт тишины начинается от открытия, а не от нулевого lastTickAt.
       this.lastSignalAt = Date.now();
       this.startWatchdog(ws);
       this.subscribe(ws);
@@ -259,28 +172,20 @@ export class BinanceProvider {
 
     ws.on('message', (raw) => {
       try {
-        // Кадр — либо ack подписки ({result,id}), либо тикер 24hrTicker
         const ticker = JSON.parse(String(raw)) as BinanceTicker;
         if (ticker.e !== '24hrTicker') return;
         const quote = normalizeTick(ticker, this.bySymbol, this.id);
         if (quote) {
-          // Живость отмечается на ПРИНЯТОМ И ОПОЗНАННОМ сообщении, а не на
-          // любом кадре: иначе ack подписки или мусор продлевали бы жизнь
-          // соединению, по которому котировок нет.
           this.lastTickAt = Date.now();
           this.lastSignalAt = this.lastTickAt;
           this.onQuote(quote);
         }
       } catch {
-        // мусорный кадр — игнор
       }
     });
 
     const scheduleRetry = () => {
-      // Обработчик устаревшего сокета не должен плодить лишние реконнекты.
       if (this.ws !== ws) return;
-      // Подписки живут на сокете: уцелевший список после разрыва заставил бы
-      // дельту решить, что подписываться не на что.
       this.subscribed.clear();
       this.stopWatchdog();
       if (this.closedByUs) return;
@@ -299,7 +204,6 @@ export class BinanceProvider {
     });
   }
 
-  /** Остановка провайдера (тесты, штатное завершение). */
   stop() {
     this.closedByUs = true;
     this.subscribed.clear();

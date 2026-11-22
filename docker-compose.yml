@@ -1,5 +1,3 @@
-# MDS: docker compose up -d --build   (БД нет — сервис stateless)
-# Ключи провайдеров — из .env рядом (compose подхватывает сам)
 services:
   mds:
     build: .

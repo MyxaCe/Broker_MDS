@@ -3,33 +3,6 @@ import { Server } from 'socket.io';
 import { config } from './config.js';
 import type { MarketFlag, Quote } from './types.js';
 
-/**
- * Fan-out хаб. Контракт — драйвер сайта (packages/realtime/drivers/socketio):
- *  client → 'subscribe' / 'unsubscribe' (string[] канонических символов)
- *  server → 'quotes:batch' (Quote[]), батч ~250 мс, только подписанное.
- * На subscribe уходит снапшот — но **только свежая его часть** (B-003).
- *
- * Инвариант, который держит этот класс: **протухшая котировка не покидает
- * хаб ни по одному пути** — ни REST-снапшотом, ни снапшотом на subscribe, ни
- * живым батчем. Один общий фильтр `pick()` на все три пути: разные пути с
- * разными правилами и есть то, как дефект возвращается.
- */
-
-/**
- * Результат снапшота. Три разных утверждения, склеивать нельзя:
- *  - `items`        — котировки, которые мы готовы назвать текущими;
- *  - `staleSymbols` — символы, у которых цена есть, но она старше порога.
- *                     `null` означает «не считали» (порога нет), пустой
- *                     массив — «считали, протухших не нашли». Пустой список
- *                     не означает «всё свежо» — КОНТРАКТЫ.md §5г.
- *  - `checked`      — сколько символов осмотрено: охват проверки, без него
- *                     «протухших нет» неотличимо от «проверять было нечего».
- *  - `missing`      — из запрошенных символов те, цены которых в памяти нет
- *                     вовсе. Отличать обязательно: «цена есть, но старая» и
- *                     «цены нет» — разные состояния с разными причинами, а
- *                     раньше оба выглядели как отсутствие строки в ответе.
- *                     Символы никто не запрашивал → `[]`: нечего называть.
- */
 export interface SnapshotResult {
   items: Quote[];
   staleSymbols: string[] | null;
@@ -38,9 +11,7 @@ export interface SnapshotResult {
 }
 
 export interface HubOptions {
-  /** Порог свежести, мс. `null` — порога нет, котировки не отдаются вовсе. */
   staleAfterMs: number | null;
-  /** Инъекция времени — для тестов. */
   now: () => number;
 }
 
@@ -50,7 +21,6 @@ export class QuoteHub {
   private readonly io: Server;
   private readonly staleAfterMs: number | null;
   private readonly now: () => number;
-  /** socket.id → { subscribed, dirty } */
   private readonly clients = new Map<string, { subscribed: Set<string>; dirty: Set<string> }>();
 
   constructor(httpServer: HttpServer, options?: Partial<HubOptions>) {
@@ -74,8 +44,6 @@ export class QuoteHub {
           state.subscribed.add(s);
           wanted.push(s);
         }
-        // Снапшот на subscribe шёл мимо любой проверки возраста — именно он
-        // и рисовал потребителю двухминутную цену как текущую (B-003).
         const { items } = this.snapshot(wanted);
         if (items.length) socket.emit('quotes:batch', items);
       });
@@ -95,18 +63,11 @@ export class QuoteHub {
     flusher.unref?.();
   }
 
-  /** Вход от провайдера: обновить снапшот и пометить dirty у подписчиков. */
   push(quote: Quote) {
     this.last.set(quote.symbol, quote);
     this.markDirty(quote.symbol);
   }
 
-  /**
-   * Единственное место, где решается «отдавать эту котировку или нет».
-   * `null` — не отдавать: либо порога нет (судить нечем), либо цена старше
-   * порога. Возвращать вместо неё ноль или прошлое значение нельзя: отказ,
-   * выглядящий правдоподобным значением, — тот самый класс дефектов.
-   */
   private pick(quote: Quote | undefined, at: number): Quote | null {
     if (!quote) return null;
     if (this.staleAfterMs === null) return null;
@@ -176,12 +137,6 @@ export class QuoteHub {
     }
   }
 
-  /**
-   * Снапшот. `symbols` не задан → вся вселенная, что у нас в памяти.
-   * Протухшее в `items` не попадает **вовсе** (решение штаба, §5б):
-   * отсутствие символа прочитать неправильно нельзя, а поле возраста рядом
-   * с ценой потребитель проигнорирует.
-   */
   snapshot(symbols?: string[]): SnapshotResult {
     const at = this.now();
     const asked = symbols && symbols.length > 0 ? symbols : null;
@@ -200,24 +155,12 @@ export class QuoteHub {
 
     return {
       items,
-      // Порога нет — мы ничего не «признали протухшим», мы просто не судили.
-      // `[]` здесь соврало бы ровно то, против чего написано §5г.
       staleSymbols: this.staleAfterMs === null ? null : staleSymbols,
       checked: candidates.length,
       missing,
     };
   }
 
-  /**
-   * Забыть цены перечисленных символов. Зовётся при смене маршрутизации
-   * (ADR-031): цена, полученная от источника, который больше не ведёт
-   * символ, — это цена от постороннего. Оставить её до порога протухания
-   * значило бы ещё `staleAfterMs` отдавать её как текущую, причём сразу
-   * после того, как оператор этот источник выключил.
-   *
-   * Возвращает, сколько записей реально убрано: без этого числа «нечего было
-   * убирать» неотличимо от «убрали».
-   */
   invalidate(symbols: Iterable<string>): number {
     let removed = 0;
     for (const symbol of symbols) {
@@ -228,12 +171,10 @@ export class QuoteHub {
     return removed;
   }
 
-  /** Есть ли вообще цена по символу (любой свежести). Для диагностики. */
   has(symbol: string): boolean {
     return this.last.has(symbol);
   }
 
-  /** Возраст каждой котировки в памяти, мс. Для /health. */
   ages(): { symbol: string; ageMs: number }[] {
     const at = this.now();
     return [...this.last.values()].map((q) => ({ symbol: q.symbol, ageMs: at - q.ts }));

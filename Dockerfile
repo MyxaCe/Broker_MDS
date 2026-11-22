@@ -1,4 +1,3 @@
-# MDS — stateless сервис котировок. docker compose up -d --build
 FROM node:22-alpine AS base
 RUN corepack enable pnpm
 

@@ -44,38 +44,16 @@ import {
 } from './platform.js';
 import type { CatalogInstrument, Quote } from './types.js';
 
-/**
- * HTTP-обвязка и жизненный цикл источников.
- *
- * Выделено из `index.ts` ради проверяемости, и это не косметика: `index.ts` —
- * скрипт верхнего уровня с `top-level await` и `listen`, импортировать его в
- * тест нельзя. Пока вся проводка жила там, **класс «написано и не
- * вызывается» в ней был непроверяем в принципе** — модульный тест зовёт
- * функцию сам и о том, что её никто не зовёт, узнать не может. Теперь сервер
- * поднимается в тесте целиком, и переключение провайдера проверяется по
- * наблюдаемому следствию, а не по тому, что функция существует.
- */
-
 export interface MdsServerDeps {
-  /** Вселенная инструментов: что адаптеры умеют стримить. */
   catalog: CatalogInstrument[];
-  /** Откуда каталог: `binance-exchange-info` или `static-fallback`. Уходит наружу. */
   catalogSource: string;
   loaded: LoadedRegistry;
   staleAfterMs: number | null;
   adminToken: string | undefined;
-  /** Ключи источников по id. Ключ не покидает MDS, наружу идёт только факт наличия. */
   keys: Map<string, string>;
   now?: () => number;
-  /** Период пересчёта маршрутизации (failover по тишине). */
   routingRecheckMs?: number;
-  /**
-   * Снят ли запрет на правку, меняющую личность ведущего источника (Р-318).
-   * Необязателен **только для тестов**; боевой запуск передаёт его из
-   * конфигурации, и умолчание здесь — запрещено, а не разрешено.
-   */
   allowRoutingIdentityChange?: boolean;
-  /** Не создавать живых адаптеров: для тестов проводки без сети. */
   providerFactory?: ProviderFactory;
   moduleV2Catalog?: ModuleV2Catalog;
   platform: {
@@ -132,9 +110,6 @@ function defaultProviderFactory(
   onQuote: (q: Quote) => void,
   onStatus: (s: MarketStatusEvent) => void,
 ): RunningProvider | null {
-  // Проверки «нужен ключ, а ключа нет» здесь НЕТ сознательно: она живёт в
-  // `syncProviders`. Две проверки одного свойства на одном пути маскируют
-  // смерть одной из них, а подменный завод в тестах обошёл бы эту.
   if (entry.adapter === 'binance') {
     const provider = new BinanceProvider(onQuote, { id: entry.id });
     provider.connect();
@@ -195,17 +170,10 @@ function defaultProviderFactory(
 export interface MdsServer {
   httpServer: HttpServer;
   hub: QuoteHub;
-  /** Применить реестр: пересчитать маршруты, переназначить источники, забыть чужие цены. */
   applyRegistry(registry: Registry, origin: RegistryOrigin): ApplyResult;
   routing(): RoutingTable | null;
   registry(): Registry | null;
-  /**
-   * Сколько тиков отброшено фильтром провенанса: пришли от источника,
-   * который этот символ не ведёт. Счётчик, а не тишина — молчаливый пропуск
-   * и есть способ, которым расхождение живёт годами.
-   */
   shadowedTicks(): number;
-  /** Пересчёт маршрутизации по тишине источников. Возвращает применённый результат. */
   recheck(): ApplyResult | null;
   pollPlatform(): Promise<PlatformPollOutcome>;
   platform(): PlatformState;
@@ -219,7 +187,6 @@ export interface ApplyResult {
   changed: { symbol: string; from: string | null; to: string | null }[];
   started: string[];
   stopped: string[];
-  /** Включённые источники, которым нужен ключ, а ключа нет. */
   missingKeys: string[];
 }
 
@@ -236,7 +203,6 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
 
   const sticky = new Map<string, string>();
   const running = new Map<string, RunningProvider>();
-  /** Когда источник был запущен: до первого тика тишину считаем от запуска. */
   const providerStartedAt = new Map<string, number>();
   const factory = deps.providerFactory ?? defaultProviderFactory;
 
@@ -276,13 +242,6 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
   const httpServer = createServer((req, res) => handle(req, res));
   const hub = new QuoteHub(httpServer, { staleAfterMs: deps.staleAfterMs, now });
 
-  /**
-   * Тик от источника. **Единственное место, где цена попадает в снапшот**, и
-   * здесь же стоит фильтр провенанса: тик от источника, который этот символ
-   * не ведёт, в хаб не проходит. Без фильтра запасной источник, оставшийся
-   * подписанным, продолжал бы перебивать ведущего — и цена менялась бы
-   * источником, которого никто не выбирал.
-   */
   let shadowed = 0;
   function onQuote(providerId: string, quote: Quote): void {
     const leader = table?.routes.get(quote.symbol)?.leader?.providerId;
@@ -299,34 +258,18 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
     hub.setMarket(event.symbol, event);
   }
 
-  /**
-   * Источники, которые заведомо не могут дать цену: включены, требуют ключ,
-   * ключа нет. Это **статическое знание** из реестра и окружения, и считать
-   * его надо ДО маршрутизации — иначе на первом круге, когда не запущен ещё
-   * никто, «не запущен» неотличимо от «отказал», и выбор запасного
-   * откладывается до следующего пересчёта.
-   */
   function providersWithoutKey(reg: Registry | null): string[] {
     return (reg?.providers ?? [])
       .filter((p) => p.enabled && p.requiresKey && (deps.keys.get(p.id) ?? '') === '')
       .map((p) => p.id);
   }
 
-  /**
-   * Источники, молчащие дольше собственного порога.
-   *
-   * Судится только то, о чём есть знание: источник, которому ничего не
-   * назначено, молчит **потому что ему нечего передавать**. Считать его
-   * молчащим значило бы сделать failover невозможным в принципе —
-   * единственный живой запасной всегда выглядел бы мёртвым. Отсутствие
-   * события здесь означает отсутствие знания, а не отказ.
-   */
   function silentByTime(): Set<string> {
     const at = now();
     const silent = new Set<string>();
     for (const entry of registry?.providers ?? []) {
       if (!entry.enabled) continue;
-      if (entry.maxSilenceMs === null) continue; // поллер: молчание штатно
+      if (entry.maxSilenceMs === null) continue;
       const provider = running.get(entry.id);
       if (!provider) continue;
       if ((table?.byProvider.get(entry.id)?.length ?? 0) === 0) continue;
@@ -353,8 +296,6 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
       stopped.push(id);
     }
 
-    // Источник без ключа не запускается вовсе, и список таких посчитан до
-    // маршрутизации — см. providersWithoutKey.
     const noKey = new Set(missingKeys);
     for (const [id, entry] of wanted) {
       if (noKey.has(id)) continue;
@@ -368,8 +309,6 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
           (event) => onStatus(id, event),
         );
         if (!created) {
-          // Завод отказался создать адаптер — состояние не «молчит», а
-          // «не запущен», и наружу оно идёт тем же списком.
           missingKeys.push(id);
           continue;
         }
@@ -396,9 +335,6 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
     for (const [symbol, providerId] of resolved.failedOver) sticky.set(symbol, providerId);
 
     const { started, stopped } = syncProviders(resolved, next);
-    // Цены символов, сменивших или потерявших источник, забываются немедленно
-    // (ADR-031): дожить до порога протухания им нельзя — это были бы
-    // `staleAfterMs` чужой цены, выдаваемой за текущую.
     const invalidated = hub.invalidate(invalidate);
     if (changed.length > 0) {
       console.info(
@@ -410,21 +346,6 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
     return { invalidated, changed, started, stopped, missingKeys: [...missingKeys] };
   }
 
-  /**
-   * Тревога на число символов с двумя и более кандидатами (Р-317).
-   *
-   * **Зачем она, если есть запрет.** Запрет закрывает служебную ручку, но
-   * реестр меняется не только ей: он читается из файла на старте, и при
-   * невыданном `MDS_ADMIN_TOKEN` правка файла — штатный и единственный путь.
-   * Отказать на старте нельзя — это значит остановить котировки из-за
-   * правки, которая уже сделана. Поэтому здесь не отказ, а крик: стартуем и
-   * кричим.
-   *
-   * Кричим **на переходе**, а не на каждом пересчёте: пересчёт идёт раз в
-   * `routingRecheckMs`, и тревога, повторяемая каждые пять секунд, перестаёт
-   * читаться на второй минуте. Возврат к нулю объявляется тоже — иначе
-   * «починили» неотличимо от «перестали смотреть».
-   */
   let lastMultiCandidate: number | null = null;
   function announceMultiCandidate(next: RoutingTable): void {
     const value = summarizeRouting(next).multiCandidate;
@@ -575,10 +496,6 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
     };
   }
 
-  /* ---------------------------------------------------------------- */
-  /* HTTP                                                              */
-  /* ---------------------------------------------------------------- */
-
   function registryHealth(): RegistryHealthInput {
     const silent = silentProviders();
     const summary = table ? summarizeRouting(table) : null;
@@ -591,10 +508,6 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
         enabled: p.enabled,
         silent: silent.has(p.id),
       })),
-      // `null`, а не `0`: таблицы маршрутизации нет — значит мы не
-      // считали, а не насчитали ноль. То же, что `coverage: null` у
-      // `/v1/instruments` (QA-05: два ответа про одну величину
-      // обязаны говорить одинаково).
       routed: summary === null ? null : summary.routed,
       checked: summary === null ? null : summary.checked,
       multiCandidate: summary === null ? null : summary.multiCandidate,
@@ -633,11 +546,6 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
     res.end(JSON.stringify(body));
   }
 
-  /**
-   * Тело отказа. Код берётся из `ADMIN_CODES` — перечня, который видно в
-   * рантайме, а не из строки на месте: перечень, который ведут руками рядом
-   * с кодом, отстаёт молча, и стиль в нём расходится незаметно (Р-087).
-   */
   function jsonError(
     res: ServerResponse,
     status: number,
@@ -664,8 +572,6 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
   }
 
   function handleAdmin(req: IncomingMessage, res: ServerResponse, url: URL): void {
-    // На служебных путях CORS-заголовка нет вовсе, а preflight отбивается:
-    // ручка управления — сервер-серверная, и из браузера её звать нельзя.
     if (req.method === 'OPTIONS') {
       jsonError(res, 405, 'method-not-allowed', 'служебная ручка только сервер-сервером', true);
       return;
@@ -781,10 +687,6 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
         {
           registry: outcome.registry,
           applied: effect,
-          // Правка, принятая в память и не записанная на диск, переживёт
-          // ровно до рестарта. Это обязано быть видно в ответе, а не только
-          // в логе: иначе админка покажет успех, а после деплоя настройка
-          // молча вернётся к прежней.
           persisted,
           ...(persisted ? {} : { persistError }),
         },
@@ -890,10 +792,6 @@ export function createMdsServer(deps: MdsServerDeps): MdsServer {
     }
 
     if (url.pathname === '/v1/instruments') {
-      // Каталог обязан называть себя: именно здесь штаб однажды принял 33
-      // инструмента запасного каталога за живые 500. Поле `catalogSource`
-      // стоит в самом ответе, а не только в `/health`, потому что читают
-      // этот ответ, а не соседний.
       const all = url.searchParams.get('all') === '1';
       let items: Record<string, unknown>[];
       if (all) {

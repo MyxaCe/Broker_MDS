@@ -3,12 +3,6 @@ import { buildHealth, buildQuotes, type HealthInput, type PlatformHealth, type Q
 import type { SnapshotResult } from './hub.js';
 import type { RouteReason } from './registry.js';
 
-/**
- * `/health` и `/v1/quotes`. Здесь живёт вторая половина B-003: ручка судила
- * о провайдере по открытому сокету при том, что возраст последнего тика у неё
- * уже был. Индикатор обязан гореть от того, что он называет.
- */
-
 const NOW = 1_800_000_000_000;
 
 function platformHealth(over: Partial<PlatformHealth> = {}): PlatformHealth {
@@ -66,8 +60,6 @@ describe('/health · судит по возрасту данных, а не по
   });
 
   it('живой сокет, тиков нет 130 с → 503 degraded с названной причиной', () => {
-    // Ровно то состояние, в котором дефект жил: сокет открыт, снапшот есть,
-    // ему две минуты. Раньше ручка отдавала здесь 200 ok / connected.
     const { httpStatus, body } = health({
       ages: [{ symbol: 'BTCUSD', ageMs: 130_000 }],
       providers: [{ name: 'binance', lastTickAt: NOW - 130_000 }],
@@ -82,9 +74,6 @@ describe('/health · судит по возрасту данных, а не по
   });
 
   it('состояние сокета наружу не отдаётся вовсе', () => {
-    // Поле, способное соврать, хуже отсутствующего: один раз принятое за
-    // признак жизни, оно будет принято снова. Проверяем весь JSON, а не
-    // только форму объекта провайдера.
     const { body } = health();
     const json = JSON.stringify(body);
     expect(json).not.toContain('connected');
@@ -109,11 +98,9 @@ describe('/health · порог свежести не задан', () => {
     expect(httpStatus).toBe(503);
     expect(body.status).toBe('degraded');
     expect(body.reason).toContain('QUOTE_STALE_AFTER_MS');
-    // Не 0 и не «всё свежо» — счётчики честно говорят «не считали».
     expect(body.quotes.fresh).toBeNull();
     expect(body.providers[0]?.fresh).toBeNull();
     expect(body.providers[0]?.stale).toBeNull();
-    // Охват при этом объявлен: в памяти был один символ.
     expect(body.quotes.total).toBe(1);
     expect(body.providers[0]?.quoted).toBe(1);
   });
@@ -134,7 +121,6 @@ describe('/health · разбивка по провайдерам', () => {
     expect(httpStatus).toBe(200);
     expect(body.status).toBe('ok');
     const twelve = body.providers.find((p) => p.name === 'twelvedata');
-    // Но его протухание при этом ВИДНО, а не замазано.
     expect(twelve?.fresh).toBe(0);
     expect(twelve?.stale).toBe(1);
     expect(twelve?.oldestQuoteAgeMs).toBe(900_000);
@@ -213,16 +199,10 @@ describe('/v1/quotes · тело ответа', () => {
     expect(body.staleAfterMs).toBeNull();
     expect(body.staleSymbols).toBeNull();
     expect(body.reason).toContain('QUOTE_STALE_AFTER_MS');
-    // Потребитель обязан отличить «MDS считает всё свежим» от «не считает».
     expect(body.checked).toBe(2);
   });
 });
 
-/**
- * Причина недоступности по каждому символу (Р-047). До реестра все эти
- * случаи выглядели снаружи одинаково — символа просто нет в `items`, и
- * «источник выключили» читалось так же, как «пока не приехало».
- */
 describe('/v1/quotes · почему символа нет — разные ответы, а не один', () => {
   function reasonFor(route: RouteReason | null, requested = 'X') {
     const reasons = new Map<string, RouteReason>();
@@ -308,11 +288,6 @@ describe('/v1/quotes · почему символа нет — разные от
   });
 });
 
-/**
- * Три состояния реестра, которые нельзя сливать в одно: не прочитан, пуст,
- * всё выключено. Чинятся по-разному — значит и называться обязаны
- * по-разному.
- */
 describe('/health · состояние реестра провайдеров', () => {
   it('реестр не прочитан → 503, и это первая причина, раньше порога свежести', () => {
     const { httpStatus, body } = health({
@@ -330,14 +305,10 @@ describe('/health · состояние реестра провайдеров', 
     });
     expect(httpStatus).toBe(503);
     expect(body.reason).toContain('не прочитан');
-    // Порог тоже не задан, но первой строкой стоит более блокирующая причина.
     expect(body.reason).not.toContain('QUOTE_STALE_AFTER_MS');
   });
 
   it('реестр не прочитан → охват null, а не ноль (QA-05)', () => {
-    // «Осмотрено 0» и «не считали» — разные утверждения. Ноль здесь был бы
-    // `empty` на месте `missing`: охват, объявленный числом, превращает
-    // «нечего было проверять» в «проверено».
     const { body } = health({
       registry: {
         origin: 'error',
@@ -352,14 +323,10 @@ describe('/health · состояние реестра провайдеров', 
     });
     expect(body.registry.routed).toBeNull();
     expect(body.registry.checked).toBeNull();
-    // И `0` сюда попасть не должен ни под каким видом: именно он читался
-    // как «посчитали».
     expect(body.registry.routed).not.toBe(0);
   });
 
   it('маршрутизация есть, назначенных ноль — это ДРУГОЕ состояние, и число настоящее', () => {
-    // Разрешающий эталонный случай рядом с ограничивающим: без него
-    // проверка выше проходила бы и при «всегда null».
     const { body } = health({
       registry: {
         origin: 'file',
@@ -375,15 +342,6 @@ describe('/health · состояние реестра провайдеров', 
     expect(body.registry.checked).toBe(484);
   });
 
-  /*
-    Тревога «кандидатов больше одного» (Р-317).
-
-    Главное здесь — что она НЕ снимает сервис с раздачи. `degraded` отвечает
-    503, то есть выводит MDS из-под балансировщика; останавливать исправную
-    службу из-за настройки хуже самого дефекта, и такую тревогу отключат
-    первой. Поэтому проверяется и то, что тревога видна, и то, что статус
-    от неё не поменялся.
-  */
   it('кандидатов больше одного → тревога в ответе, но статус ok и 200', () => {
     const { httpStatus, body } = health({
       registry: {
@@ -400,7 +358,6 @@ describe('/health · состояние реестра провайдеров', 
     expect(body.status).toBe('ok');
     expect(body.warning).toContain('7');
     expect(body.warning).toContain('скачком цены');
-    // И это не `reason`: два поля с разным смыслом, а не одно на оба случая.
     expect(body.reason).toBeUndefined();
   });
 
@@ -409,8 +366,6 @@ describe('/health · состояние реестра провайдеров', 
   });
 
   it('маршрутизации нет → «не считали», и это НЕ тревога', () => {
-    // `null` не тревожит: отсутствие замера — не находка. Иначе нечитаемый
-    // реестр поднимал бы тревогу не о том, и чинить пошли бы не туда.
     const { body } = health({
       registry: {
         origin: 'error',

@@ -6,14 +6,6 @@ import { config } from './config.js';
 import { QuoteHub } from './hub.js';
 import type { Quote } from './types.js';
 
-/**
- * Хаб: снапшот, протухание, фан-аут, восстановление после рестарта.
- *
- * Регресс на B-003 пишется на том состоянии, в котором дефект жил: снапшот в
- * памяти есть, он старый, соединение цело. Придуманный «пустой снапшот»
- * проверял бы соседнее.
- */
-
 const NOW = 1_800_000_000_000;
 
 function quote(symbol: string, ageMs: number, price = 100): Quote {
@@ -24,8 +16,6 @@ function quote(symbol: string, ageMs: number, price = 100): Quote {
     price,
     digits: 2,
     changePercent: 1.5,
-    // Несимметричные вокруг цены нарочно: симметричный спред прошёл бы и
-    // при перепутанных местами полях.
     bid: price - 0.3,
     ask: price + 0.7,
     ts: NOW - ageMs,
@@ -68,7 +58,6 @@ describe('QuoteHub · протухшая котировка не отдаётс�
     hub.push(quote('ETHUSD', 130_000, 2_000));
 
     const snap = hub.snapshot(['ETHUSD']);
-    // Ни записи с price 0, ни записи со старой ценой — записи нет вообще.
     expect(snap.items).toEqual([]);
     expect(snap.items.some((q) => q.symbol === 'ETHUSD')).toBe(false);
   });
@@ -88,8 +77,6 @@ describe('QuoteHub · протухшая котировка не отдаётс�
     hub.push(quote('BTCUSD', 1_000));
     hub.push(quote('ETHUSD', 130_000));
 
-    // Молчаливый фильтр обязан быть доказан для КАЖДОЙ операции источника:
-    // «вся вселенная» — отдельный путь, и он тоже обязан фильтровать.
     const snap = hub.snapshot();
     expect(snap.items.map((q) => q.symbol)).toEqual(['BTCUSD']);
     expect(snap.staleSymbols).toEqual(['ETHUSD']);
@@ -102,11 +89,8 @@ describe('QuoteHub · пустой список протухших ≠ «всё 
     hub.push(quote('BTCUSD', 1_000));
 
     const snap = hub.snapshot(['BTCUSD']);
-    // Fail-closed: судить о свежести нечем — значит не отдаём ничего.
     expect(snap.items).toEqual([]);
-    // null, а НЕ []: `[]` сказало бы «протухших не нашли», то есть соврало.
     expect(snap.staleSymbols).toBeNull();
-    // Охват при этом объявлен: осмотреть было что.
     expect(snap.checked).toBe(1);
   });
 
@@ -124,7 +108,6 @@ describe('QuoteHub · пустой список протухших ≠ «всё 
     const { hub } = makeHub({ staleAfterMs: 10_000 });
     const snap = hub.snapshot(['BTCUSD']);
     expect(snap.staleSymbols).toEqual([]);
-    // Ноль осмотренных: тот же пустой список протухших, другой смысл.
     expect(snap.checked).toBe(0);
   });
 });
@@ -145,12 +128,10 @@ describe('QuoteHub · восстановление состояния после
     first.push(quote('BTCUSD', 0, 70_000));
     expect(first.snapshot(['BTCUSD']).items).toHaveLength(1);
 
-    // «Рестарт»: состояние в памяти и есть всё состояние сервиса.
     const second = makeHub({ staleAfterMs: 10_000 }).hub;
     expect(second.snapshot(['BTCUSD']).items).toEqual([]);
     expect(second.snapshot().checked).toBe(0);
 
-    // Восстановление проверяем ПОВЕДЕНИЕМ: пришёл тик — снапшот отдаётся.
     second.push(quote('BTCUSD', 0, 71_000));
     expect(second.snapshot(['BTCUSD']).items[0]?.price).toBe(71_000);
   });
@@ -158,10 +139,6 @@ describe('QuoteHub · восстановление состояния после
 
 describe('QuoteHub · умолчание порога берётся из конфига, а не выдумывается', () => {
   it('без опций хаб наследует config.staleAfterMs (в тестах он не задан)', () => {
-    // Проверка того самого режима, в котором сервис работает по умолчанию:
-    // QUOTE_STALE_AFTER_MS не задан → config.staleAfterMs === null →
-    // хаб не отдаёт котировок. Тест существует, чтобы «умолчание» не
-    // просочилось в код мимо конфига.
     expect(config.staleAfterMs).toBeNull();
     const server = createServer();
     servers.push(server);
@@ -172,10 +149,6 @@ describe('QuoteHub · умолчание порога берётся из кон
     expect(snap.staleSymbols).toBeNull();
   });
 });
-
-/* ------------------------------------------------------------------ */
-/* Фан-аут по socket.io — путь, которым ходит сайт                     */
-/* ------------------------------------------------------------------ */
 
 function listen(server: HttpServer): Promise<number> {
   return new Promise((resolve) => {
@@ -235,9 +208,6 @@ describe('QuoteHub · живой батч', () => {
   });
 
   it('лучшие цены доезжают до сокета, а не теряются по дороге (MDS-12)', async () => {
-    // Разбор, доказанный у провайдера, ничего не говорит о проводе: поле
-    // может быть прочитано и потеряно между хабом и сокетом. Проверяется
-    // то, что ПРИШЛО подписчику, а не то, что положили в хаб.
     const { hub, server } = makeHub({ staleAfterMs: 10_000 });
     const socket = await connect(await listen(server));
     socket.emit('subscribe', ['BTCUSD']);
@@ -252,9 +222,6 @@ describe('QuoteHub · живой батч', () => {
   });
 
   it('пустые лучшие цены доезжают ПУСТЫМИ, а не исчезают из тела', async () => {
-    // Исчезнувшее поле и поле со значением `null` — разные сообщения:
-    // первое потребитель прочитает как «сосед ещё не шлёт», второе как
-    // «шлёт, и у него этого нет». Второй поставщик даёт ровно второе.
     const { hub, server } = makeHub({ staleAfterMs: 10_000 });
     const socket = await connect(await listen(server));
     socket.emit('subscribe', ['XAUUSD']);
@@ -276,8 +243,6 @@ describe('QuoteHub · живой батч', () => {
     socket.emit('subscribe', ['BTCUSD']);
     await new Promise((r) => setTimeout(r, 100));
 
-    // Провайдер отдал котировку с устаревшим ts — так выглядит догоняющий
-    // кадр после реконнекта. Пометка dirty стоит, но отдавать нечего.
     hub.push(quote('BTCUSD', 130_000, 70_000));
     expect(await nextBatch(socket, 1_500)).toBe('silence');
   });
